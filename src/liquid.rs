@@ -587,6 +587,50 @@ pub fn paint_glass_slider(ui: &egui::Ui, rect: Rect, radius: u8) {
     }
 }
 
+/// 有节流的忙碌指示器（替代 `ui.spinner()`）。
+///
+/// egui 自带的 `Spinner` 每帧无条件 `request_repaint()`，会把界面拉到**无上限帧率**。
+/// 本应用是透明玻璃窗口（强制 OpenGL 后端 + DWM 材质），单帧呈现开销远大于 UI
+/// 布局开销：实测 UI 体仅 0.4ms/帧，整帧却要烧掉约 6ms CPU。满速渲染会让整机
+/// CPU 飙升（下载时实测达 53% 单核），并放大合成器偶发的长时间停顿，表现为
+/// 「下载时整个界面卡」。这里改为按固定间隔预订重绘（约 25fps），观感基本一致。
+pub fn spinner(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    // 实测本窗口帧间隔 ≈ 请求延时 − 一个垂直同步周期（33→17、66→50、200→184ms），
+    // 故请求 50ms 得到约 33ms（30fps）的转动节奏，观感与 egui 自带 spinner 一致。
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(50));
+
+    let t = ui.input(|i| i.time) as f32;
+    let color = ui.visuals().weak_text_color();
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = rect.width() * 0.34;
+
+    // 8 个点位固定成环，亮度「头部」随时间绕环移动（彗尾效果）。
+    const N: f32 = 8.0;
+    let head = (t * 0.9 * N).rem_euclid(N);
+    for i in 0..N as usize {
+        let idx = i as f32;
+        let angle = idx / N * std::f32::consts::TAU;
+        let behind = (head - idx).rem_euclid(N) / N; // 0=头部，越大越靠尾
+        let alpha = 0.15 + 0.85 * (1.0 - behind);
+        painter.circle_filled(
+            center + Vec2::new(angle.cos(), angle.sin()) * radius,
+            1.6,
+            Color32::from_rgba_unmultiplied(
+                color.r(),
+                color.g(),
+                color.b(),
+                (alpha * 255.0) as u8,
+            ),
+        );
+    }
+}
+
 /// 画分段控件的凹槽轨道。
 pub fn paint_segment_track(ui: &egui::Ui, rect: Rect, radius: u8) {
     let painter = ui.painter();

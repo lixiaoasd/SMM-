@@ -387,7 +387,7 @@ fn image_block(ui: &mut egui::Ui, url: &str) {
         imgcache::ImgState::Loading => {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.spinner();
+                crate::liquid::spinner(ui);
                 ui.label(RichText::new("图片加载中…").size(11.0).weak());
             });
             ui.add_space(2.0);

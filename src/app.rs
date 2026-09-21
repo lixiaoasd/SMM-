@@ -1264,6 +1264,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
         if !self.theme_applied {
             liquid::install(&ctx);
             self.theme_applied = true;
@@ -1688,7 +1689,7 @@ impl App {
                             );
                         }
                     }
-                    ui.spinner();
+                    liquid::spinner(ui);
                     if job.state == MJobState::Downloading
                         && ui.small_button("取消").clicked()
                     {
@@ -1703,7 +1704,7 @@ impl App {
                                 .fill(liquid::PRIMARY),
                         );
                     } else {
-                        ui.add(egui::ProgressBar::new(0.0).animate(true));
+                        ui.add(egui::ProgressBar::new(0.0));
                     }
                 }
             });
@@ -1808,13 +1809,18 @@ impl App {
                 // 目标展开度（下一帧生效）
                 let target = if hovered { 1.0 } else { 0.0 };
                 self.island_expand += (target - self.island_expand) * 0.18;
-                // 动画期间必须预订下一帧（脉动/展开/完成倒计时都按 60fps 走），
-                // 否则只有鼠标事件和 500ms 轮询才触发重绘，动画会一顿一顿。
-                if is_downloading
-                    || self.island_done_secs > 0.0
-                    || (target - self.island_expand).abs() > 0.002
-                {
-                    ctx.request_repaint_after(Duration::from_millis(16));
+                // 动画期间必须预订下一帧，否则只有鼠标事件和 500ms 轮询才触发重绘。
+                // 实测本窗口的帧间隔 ≈ 请求延时 − 一个垂直同步周期（500→485、
+                // 200→184、66→50、33→17ms 四点吻合），故请求值 = 目标间隔 + VSYNC_MS。
+                // 展开/收起是交互瞬间，要跟手 → 约 60fps；常态脉动/波形/倒计时
+                // 30fps 足够顺滑，且整帧呈现开销远大于 UI 布局（实测体 0.4ms，
+                // 满帧率会让整机 CPU 明显上升并放大偶发卡顿）。
+                const VSYNC_MS: u64 = 17;
+                let expanding = (target - self.island_expand).abs() > 0.002;
+                if expanding {
+                    ctx.request_repaint_after(Duration::from_millis(16 + VSYNC_MS));
+                } else if is_downloading || self.island_done_secs > 0.0 {
+                    ctx.request_repaint_after(Duration::from_millis(33 + VSYNC_MS));
                 }
 
                 let painter = ui.painter();
@@ -2077,7 +2083,7 @@ impl App {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     if self.mirror_loading {
-                        ui.spinner();
+                        liquid::spinner(ui);
                         ui.add_space(6.0);
                         ui.label(RichText::new("正在拉取清单…").color(liquid::PRIMARY));
                     } else if liquid::cta_button(ui, "⚡ 拉取镜像清单", true).clicked() {
@@ -2110,7 +2116,7 @@ impl App {
                     .color(liquid::text_dim()),
             );
             if self.mirror_loading {
-                ui.spinner();
+                liquid::spinner(ui);
             }
             if let Some(e) = &self.mirror_error {
                 ui.label(
@@ -2674,7 +2680,7 @@ impl App {
                     }
                 }
                 if self.list_loading {
-                    ui.spinner();
+                    liquid::spinner(ui);
                 } else if liquid::cta_button(
                     ui,
                     if self.list_loaded { "刷新列表" } else { "拉取模组列表" },
@@ -2703,7 +2709,7 @@ impl App {
                     self.query_id();
                 }
                 if self.id_loading {
-                    ui.spinner();
+                    liquid::spinner(ui);
                 }
             });
             if let Some(e) = &self.id_error {
@@ -3015,7 +3021,7 @@ impl App {
                     );
                 }
                 if job.is_active() {
-                    ui.spinner();
+                    liquid::spinner(ui);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let WState::Finished(false, _) = job.state
@@ -3325,7 +3331,7 @@ impl App {
                     self.send_host_command("quit");
                 }
                 if self.host_busy {
-                    ui.spinner();
+                    liquid::spinner(ui);
                 }
             });
             ui.add_space(2.0);
@@ -3563,7 +3569,7 @@ impl App {
                     liquid::pill(ui, ip, liquid::TEAL, liquid::TEAL_SOFT);
                 }
                 if self.host_busy {
-                    ui.spinner();
+                    liquid::spinner(ui);
                 }
             });
             ui.add_space(4.0);
@@ -5087,7 +5093,7 @@ impl App {
                     self.install_smapi_bg();
                 }
                 if self.smapi_busy {
-                    ui.spinner();
+                    liquid::spinner(ui);
                 }
             });
             ui.label(
