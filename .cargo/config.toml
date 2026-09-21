@@ -1,0 +1,10 @@
+# 使用国内镜像加速 crates.io 下载
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+# 使用 GNU 工具链 + 自包含链接（无需本机 gcc/MSVC）
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]

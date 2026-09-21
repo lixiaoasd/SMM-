@@ -1,0 +1,13 @@
+[Unit]
+Description=Nexus Mods mirror sync (FireSVM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=admin
+# 必须直连，勿加 --proxy（代理节点不稳定曾导致定时任务失败；代理仅 run-sync.sh 手动备用）
+ExecStart=/usr/bin/flock -n /tmp/mirror-sync.lock /usr/bin/python3 /opt/mirror/sync-nexus.py --period 1m
+WorkingDirectory=/opt/mirror
+StandardOutput=append:/opt/mirror/sync.log
+StandardError=append:/opt/mirror/sync.log

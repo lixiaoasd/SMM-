@@ -1,0 +1,10 @@
+{
+  "Name": "HostKit 房主助手",
+  "Author": "FireSVM",
+  "Version": "1.0.0",
+  "Description": "一键开服与房主辅助：自动读档开房、挂机自动暂停时间、无人等待自动暂停、玩家上下线公告、远程冻结时间。与管理器通过 Mods/FireSVM.HostKit 下的 json 文件通信。",
+  "UniqueID": "FireSVM.HostKit",
+  "EntryDll": "FireSVM.HostKit.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}

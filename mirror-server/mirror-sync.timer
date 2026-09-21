@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Nexus mirror sync at 04:00
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
