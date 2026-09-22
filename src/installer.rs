@@ -289,15 +289,28 @@ pub fn install_smapi(game_path: &Path) -> Result<String> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
-    std::process::Command::new(&installer_exe)
+    let mut child = std::process::Command::new(&installer_exe)
         .current_dir(&dir)
         .args(["--no-prompt", "--install", "--game-path"])
         .arg(game_path)
         .spawn()
         .map_err(|e| anyhow::anyhow!("启动安装器失败：{}", e))?;
 
+    // 等待安装器完成后再清理临时目录（install.dat 等文件在安装过程中需要读取）。
+    let status = child
+        .wait()
+        .map_err(|e| anyhow::anyhow!("等待安装器失败：{}", e))?;
+
     let _ = std::fs::remove_dir_all(&extract);
-    Ok("已启动 SMAPI 安装器，稍后可在游戏目录看到 StardewModdingAPI.exe".to_string())
+
+    if status.success() {
+        Ok("SMAPI 安装完成，可在游戏目录看到 StardewModdingAPI.exe".to_string())
+    } else {
+        anyhow::bail!(
+            "SMAPI 安装器异常退出（code {}）",
+            status.code().unwrap_or(-1)
+        );
+    }
 }
 
 /// 解压 zip 到目标目录。

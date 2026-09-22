@@ -158,8 +158,7 @@ fn parse(text: &str) -> Vec<Block> {
             }
         }
 
-        let bullet = (line.contains("[*]") || line.contains("[*]")) && list_depth > 0
-            || line.contains("[*]");
+        let bullet = list_depth > 0 && line.contains("[*]");
 
         let spans = parse_inline(line);
         if !spans.is_empty() {

@@ -316,7 +316,7 @@ pub fn scan_saves() -> Vec<SaveInfo> {
             play_hours: ms as f64 / 3_600_000.0,
             can_host: xml_text(&text, "slotCanHost")
                 .map(|v| v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
+                .unwrap_or(false),
             saved_ago_secs: std::fs::metadata(dir.join("SaveGameInfo"))
                 .and_then(|m| m.modified())
                 .ok()

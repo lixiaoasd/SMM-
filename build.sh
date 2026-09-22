@@ -52,10 +52,17 @@ fi
 
 # ---------- 2) 管理器本体 ----------
 MODE="${1:-release}"
-if [ "$MODE" = "release" ]; then
-    "$TC/bin/cargo.exe" build --release -j 4
-    echo "完成：target/release/stardew-mod-manager.exe"
-else
-    "$TC/bin/cargo.exe" build -j 4
-    echo "完成：target/debug/stardew-mod-manager.exe"
-fi
+case "$MODE" in
+    release)
+        "$TC/bin/cargo.exe" build --release -j 4
+        echo "完成：target/release/stardew-mod-manager.exe"
+        ;;
+    locked)
+        "$TC/bin/cargo.exe" build --release --features locked-mirror -j 4
+        echo "完成：target/release/stardew-mod-manager.exe（locked-mirror）"
+        ;;
+    *)
+        "$TC/bin/cargo.exe" build -j 4
+        echo "完成：target/debug/stardew-mod-manager.exe"
+        ;;
+esac

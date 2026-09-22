@@ -420,18 +420,19 @@ fn handle_http(stream: TcpStream, mods_path: &Path, profile: &Profile) -> Result
         }
         ("GET", p) if p.starts_with("/mods/") => {
             let folder = url_decode(&p[6..]);
-            let mod_path = mods_path.join(&folder);
-            if !mod_path.is_dir() {
-                ("404 Not Found", "text/plain", b"Not found".to_vec())
-            } else {
-                match zip_folder(&mod_path) {
-                    Ok(data) => ("200 OK", "application/zip", data),
-                    Err(_) => (
-                        "500 Internal Server Error",
-                        "text/plain",
-                        b"Zip failed".to_vec(),
-                    ),
+            // 用 sanitize_join 防止路径穿越（拒绝 .. 和绝对路径）。
+            match sanitize_join(mods_path, &folder) {
+                Ok(mod_path) if mod_path.is_dir() => {
+                    match zip_folder(&mod_path) {
+                        Ok(data) => ("200 OK", "application/zip", data),
+                        Err(_) => (
+                            "500 Internal Server Error",
+                            "text/plain",
+                            b"Zip failed".to_vec(),
+                        ),
+                    }
                 }
+                _ => ("404 Not Found", "text/plain", b"Not found".to_vec()),
             }
         }
         ("POST", "/receive-mod") => {

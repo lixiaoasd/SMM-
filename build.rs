@@ -1,7 +1,5 @@
 //! 构建脚本（星露谷物语模组管理器）。
 //!
-//! - WebView2Loader.dll 已通过 vendor 的 webview2-com-sys 用 `include_bytes!`
-//!   嵌入可执行文件，运行时动态加载，无需复制任何 DLL。
 //! - Windows 下用 windres 把 assets/app.ico 编译为 COFF 目标文件并链接进 exe，
 //!   使文件资源管理器 / 任务栏显示自定义图标。
 //!

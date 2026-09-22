@@ -298,7 +298,8 @@ fn host_smoke() {
     }
 
     let mut cfg = settings.host.clone();
-    cfg.auto_host = true;
+    // 冒烟测试不设 auto_host=true，避免下次启动游戏时自动开房。
+    cfg.auto_host = false;
     cfg.save_name = hostable.map(|s| s.folder.clone()).unwrap_or_default();
     match server::write_config(&game, &cfg) {
         Ok(()) => println!("配置已写入（存档={}，AFK={} 分钟）", cfg.save_name, cfg.afk_minutes),
