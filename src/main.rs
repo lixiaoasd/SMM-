@@ -263,6 +263,7 @@ fn p2p_smoke() {
     }
 
     // 测试 /mods
+    let mut first_folder: Option<String> = None;
     let url = format!("http://127.0.0.1:{}/mods", p2p::P2P_PORT);
     println!("GET {url}");
     match reqwest::blocking::get(&url) {
@@ -274,9 +275,59 @@ fn p2p_smoke() {
                 for m in mods.iter().take(5) {
                     println!("    {} v{} by {} ({})", m.name, m.version, m.author, m.size_label());
                 }
+                first_folder = mods.first().map(|m| m.folder.clone());
             }
         }
         Err(e) => println!("  请求失败：{e}"),
+    }
+
+    // ── 路径穿越回归测试 ──
+    // 用百分号编码绕开客户端对点段的归一化，直接考验服务端解码后的校验
+    //（issue #3：/mods/ 曾可读任意目录；注意 Windows 上 `\Windows`、`C:foo`
+    //  的 is_absolute() 都是 false，只查绝对路径和 .. 是不够的）。
+    println!("\n路径穿越回归测试（全部应为 404）：");
+    let attacks = [
+        "/mods/%2e%2e%2f%2e%2e%2fWindows",
+        "/mods/..%5c..%5cWindows",
+        "/mods/%5cWindows",
+        "/mods/%2fWindows",
+        "/mods/C%3afoo",
+        "/mods/%5c%5cserver%5cshare",
+    ];
+    let mut leaked = 0;
+    for a in attacks {
+        let full = format!("http://127.0.0.1:{}{a}", p2p::P2P_PORT);
+        match reqwest::blocking::get(&full) {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                let bad = code == 200;
+                if bad {
+                    leaked += 1;
+                }
+                println!(
+                    "  {:<34} -> {}{}",
+                    a,
+                    code,
+                    if bad { "   ← 越界读到了东西！" } else { "" }
+                );
+            }
+            Err(e) => println!("  {a} 请求失败：{e}"),
+        }
+    }
+    println!("  越界用例数 = {leaked}（必须为 0）");
+
+    // 正常路径仍应可用
+    if let Some(folder) = first_folder {
+        let full = format!("http://127.0.0.1:{}/mods/{}", p2p::P2P_PORT, folder);
+        match reqwest::blocking::get(&full) {
+            Ok(resp) => println!(
+                "\n正常下载 /mods/{} -> {}（{} 字节，应为 200）",
+                folder,
+                resp.status(),
+                resp.bytes().map(|b| b.len()).unwrap_or(0)
+            ),
+            Err(e) => println!("\n正常下载请求失败：{e}"),
+        }
     }
 
     // 测试附近玩家（本地只有自己，应该 0 个）

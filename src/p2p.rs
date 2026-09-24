@@ -297,16 +297,27 @@ fn zip_folder(src: &Path) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+/// 安全拼接：只接受 base 内的相对路径，拒绝绝对路径、盘符、UNC 与 `..`。
+///
+/// 注意**不能**写成 `Path::is_absolute()` 判断 + `base.join()`：Windows 上
+/// `\Windows`（有根无盘符）和 `C:foo`（盘符相对）的 `is_absolute()` 都是 false，
+/// 但 `join` 之后会跳到 base 之外（`\Windows` → `C:\Windows`），等于放行任意目录读取。
+/// 这里逐段累积，只接受 Normal 组件，并额外校验结果仍在 base 内。
 fn sanitize_join(base: &Path, rel: &str) -> Result<PathBuf> {
-    let p = Path::new(rel);
-    if p.is_absolute()
-        || p
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    let clean = rel.replace('\\', "/");
+    let mut out = base.to_path_buf();
+    for comp in Path::new(&clean).components() {
+        match comp {
+            std::path::Component::Normal(c) => out.push(c),
+            std::path::Component::CurDir => {}
+            // ParentDir / RootDir / Prefix（含 UNC 与 `C:`）一律拒绝。
+            _ => return Err(anyhow!("不安全的路径：{rel}")),
+        }
+    }
+    if !out.starts_with(base) {
         return Err(anyhow!("不安全的路径：{rel}"));
     }
-    Ok(base.join(p))
+    Ok(out)
 }
 
 // ============================================================
