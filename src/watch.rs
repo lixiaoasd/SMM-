@@ -174,8 +174,19 @@ pub fn log_line(msg: &str) {
     })();
 }
 
+/// 下载文件夹解析结果缓存。
+static DOWNLOADS_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
 /// 系统下载文件夹（注册表读取用户自定义位置，失败回退 %USERPROFILE%\Downloads）。
+///
+/// 结果**必须缓存**：底层要起一个 `reg query` 子进程（实测 16~28ms），而 UI 每帧
+/// 都要显示「监控目录：…」。下载期间界面以 20~30fps 重绘，每帧起子进程等于每秒
+/// 堵住 UI 线程几百毫秒，表现就是「下载时卡死、下载完就好」。目录位置运行期不变。
 pub fn downloads_dir() -> Option<PathBuf> {
+    DOWNLOADS_DIR.get_or_init(resolve_downloads_dir).clone()
+}
+
+fn resolve_downloads_dir() -> Option<PathBuf> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const GUID: &str = "{374DE290-123F-4565-9164-39C4925E467B}";

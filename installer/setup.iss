@@ -1,7 +1,7 @@
 ; 星露谷物语模组管理器 —— Inno Setup 安装脚本
 ; 编译：ISCC.exe setup.iss  →  Output\FireSVM-ModManager-Setup-<ver>.exe
 #define MyAppName "星露谷物语模组管理器"
-#define MyAppVersion "b0.4"
+#define MyAppVersion "b0.5"
 #define MyAppPublisher "FireSVM"
 #define MyAppExeName "stardew-mod-manager.exe"
 
@@ -15,7 +15,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=Output
-OutputBaseFilename=FireSVM-ModManager-Setup-b0.4
+OutputBaseFilename=FireSVM-ModManager-Setup-b0.5
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
