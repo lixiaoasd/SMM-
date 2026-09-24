@@ -49,6 +49,52 @@ static SOCIAL_MSG_RESULT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SYNC_PROGRESS_RESULT: OnceLock<Mutex<Option<(String, bool, usize, usize)>>> =
     OnceLock::new();
 
+/// 统一的后台任务执行器：捕获 panic，并**保证结果槽一定被写入**。
+///
+/// 这些任务几乎都对应一个 UI 加载标志（list_loading / host_busy / smapi_busy…）。
+/// 直接用 `std::thread::spawn` 的话，线程一旦 panic 就静默死亡、结果槽永远是空，
+/// 对应按钮会永久卡在 loading/禁用态，用户只能重启程序；这里退出前一定写兜底值。
+fn spawn_bg<T, F>(slot: &'static Mutex<Option<T>>, fallback: T, f: F)
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let v = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(v) => v,
+            Err(_) => {
+                crate::mirror::log_line("后台任务 panic：已写入兜底值以解锁界面");
+                fallback
+            }
+        };
+        *slot.lock().unwrap() = Some(v);
+    });
+}
+
+/// 判断文件标题里是否出现「独立」的十进制数字 `id`（两侧都不是数字）。
+/// 用于识别 Nexus 文件名里的 `<名字>-<mod id>-<版本>-<时间戳>` 段。
+fn has_id_token(title: &str, id: u32) -> bool {
+    let needle = id.to_string();
+    let mut from = 0usize;
+    while let Some(rel) = title[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = title[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_digit());
+        let after_ok = title[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1; // 数字是单字节，这里仍是字符边界
+    }
+    false
+}
+
 // ---------- 页面 ----------
 
 #[derive(PartialEq, Clone, Copy)]
@@ -651,11 +697,29 @@ impl App {
 
         // 串行队列：当前模组有新的监控任务落定（装完或失败）就开下一个。
         if self.dl_current.is_some() {
+            // 归一化后判断「落定的这个 zip 是不是本次队列在等的模组」：
+            // 队列进行中用户可能还在浏览器里下载别的东西，不加这道判断会被
+            // 误当成当前模组完成而提前开下一个页面，队列就乱了。
+            let (cur_id, cur) = self
+                .dl_current
+                .as_ref()
+                .map(|(id, n)| (*id, Self::normalize_name(n)))
+                .unwrap_or((0, String::new()));
             let mut settled: Option<String> = None;
             for j in &self.watch_jobs {
                 if j.id > self.dl_baseline
                     && let WState::Finished(ok, detail) = &j.state
                 {
+                    let t = Self::normalize_name(&j.title);
+                    let name_hit = !cur.is_empty()
+                        && t.chars().count() >= 3
+                        && (t.contains(&cur) || cur.contains(&t));
+                    // 文件名常被缩写（Stardew Valley Expanded → SVE），
+                    // 再用 Nexus 文件名里的 `<名字>-<mod id>-…` 段兜底。
+                    let id_hit = cur_id >= 1000 && has_id_token(&j.title, cur_id);
+                    if !name_hit && !id_hit {
+                        continue; // 与本模组无关的下载：忽略（可点「跳过此模组」手动前进）
+                    }
                     settled = Some(if *ok {
                         format!("✅ {detail}")
                     } else {
@@ -707,18 +771,20 @@ impl App {
         if self.page == Page::Host {
             if !self.saves_loaded {
                 self.saves_loaded = true;
-                std::thread::spawn(|| {
-                    let list = server::scan_saves();
-                    *SAVES_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(list);
-                });
+                spawn_bg(
+                    SAVES_RESULT.get_or_init(|| Mutex::new(None)),
+                    Vec::new(),
+                    server::scan_saves,
+                );
             }
             if !self.probe_busy && self.probe_at.elapsed() > Duration::from_secs(3) {
                 self.probe_busy = true;
                 let game = self.env.game_path.clone();
-                std::thread::spawn(move || {
-                    let p = HostProbe::collect(game.as_deref());
-                    *HOST_PROBE_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(p);
-                });
+                spawn_bg(
+                    HOST_PROBE_RESULT.get_or_init(|| Mutex::new(None)),
+                    HostProbe::default(),
+                    move || HostProbe::collect(game.as_deref()),
+                );
             }
         }
 
@@ -733,8 +799,14 @@ impl App {
                 Ok(mods) => {
                     self.peer_mods = mods.clone();
                     self.peer_mods_error = None;
-                    // 自动与本地模组对比
-                    let local = self.env.mods_path.as_deref().map(p2p::list_shared_mods).unwrap_or_default();
+                    // 自动与本地模组对比（本地清单含已禁用模组：禁用不等于没装，
+                    // 否则会被判成缺失、重新下载一遍还多出一份同名目录）。
+                    let local = self
+                        .env
+                        .mods_path
+                        .as_deref()
+                        .map(p2p::list_local_mods)
+                        .unwrap_or_default();
                     self.sync = Some(p2p::compare_mods(&local, &mods));
                     // 如果有缺失且未为该好友弹过窗，弹窗
                     if let Some(s) = &self.sync {
@@ -751,7 +823,7 @@ impl App {
         }
         if let Some(msg) = SOCIAL_MSG_RESULT.get().and_then(|m| m.lock().unwrap().take()) {
             self.social_msg = msg;
-            // 传送/下载后刷新模组列表
+            // 下载/补齐后刷新模组列表
             self.refresh();
         }
         // 批量补齐进度
@@ -774,10 +846,11 @@ impl App {
             // 每 3 秒在后台拉取一次附近玩家列表
             if self.peers_at.elapsed() > Duration::from_secs(3) {
                 self.peers_at = Instant::now();
-                std::thread::spawn(|| {
-                    let list = p2p::get_peers();
-                    *PEERS_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(list);
-                });
+                spawn_bg(
+                    PEERS_RESULT.get_or_init(|| Mutex::new(None)),
+                    Vec::new(),
+                    p2p::get_peers,
+                );
             }
             // 自动侦测：如果已上线且有在线好友但未选中，自动选第一个并拉取模组
             if self.social_online && !self.peer_mods_loading {
@@ -789,10 +862,11 @@ impl App {
                         self.selected_friend_ip = p.ip.clone();
                         self.peer_mods_loading = true;
                         let ip = p.ip.clone();
-                        std::thread::spawn(move || {
-                            let r = p2p::fetch_peer_mods(&ip).map_err(|e| e.to_string());
-                            *PEER_MODS_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(r);
-                        });
+                        spawn_bg(
+                            PEER_MODS_RESULT.get_or_init(|| Mutex::new(None)),
+                            Err("后台任务异常终止，请重试".to_string()),
+                            move || p2p::fetch_peer_mods(&ip).map_err(|e| e.to_string()),
+                        );
                     }
                 }
             }
@@ -813,10 +887,11 @@ impl App {
         self.list_error = None;
         let key = self.settings.nexus_api_key.trim().to_string();
         let lt = self.list_type.api_key_name().to_string();
-        std::thread::spawn(move || {
-            let r = web::nexus_mod_list(&key, &lt);
-            *LIST_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(r);
-        });
+        spawn_bg(
+            LIST_RESULT.get_or_init(|| Mutex::new(None)),
+            Err("后台任务异常终止，请重试".to_string()),
+            move || web::nexus_mod_list(&key, &lt),
+        );
     }
 
     fn query_id(&mut self) {
@@ -831,10 +906,11 @@ impl App {
         self.id_loading = true;
         self.id_error = None;
         let key = self.settings.nexus_api_key.trim().to_string();
-        std::thread::spawn(move || {
-            let r = web::nexus_mod_info(&key, id);
-            *ID_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some((id, r));
-        });
+        spawn_bg(
+            ID_RESULT.get_or_init(|| Mutex::new(None)),
+            (id, Err("后台任务异常终止，请重试".to_string())),
+            move || (id, web::nexus_mod_info(&key, id)),
+        );
     }
 
     /// 串行下载队列：一次只开一个文件页，等这个模组下载安装完成后
@@ -937,10 +1013,11 @@ impl App {
             return;
         };
         self.zip_msg = format!("正在安装 {} …", path.display());
-        std::thread::spawn(move || {
-            let r = installer::install_archive(&path, &mods_dir).map_err(|e| e.to_string());
-            *ZIP_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(r);
-        });
+        spawn_bg(
+            ZIP_RESULT.get_or_init(|| Mutex::new(None)),
+            Err("后台任务异常终止，请重试".to_string()),
+            move || installer::install_archive(&path, &mods_dir).map_err(|e| e.to_string()),
+        );
     }
 
     /// 判断镜像模组是否已安装：unique_id 精确匹配优先，否则名称归一化匹配。
@@ -1218,14 +1295,18 @@ impl App {
         let base = self.effective_mirror_url();
         self.mirror_loading = true;
         self.mirror_error = None;
-        std::thread::spawn(move || {
-            let r = mirror::fetch_index(&base);
+        let base2 = base.clone();
+        spawn_bg(
+            MIRROR_LIST_RESULT.get_or_init(|| Mutex::new(None)),
+            Err("后台任务异常终止，请重试".to_string()),
+            move || mirror::fetch_index(&base),
+        );
+        spawn_bg(
+            MIRROR_COLLS_RESULT.get_or_init(|| Mutex::new(None)),
+            Vec::new(),
             // 合集是增强信息：拉取失败/旧镜像无此文件时静默降级为空列表。
-            let colls = mirror::fetch_collections(&base).unwrap_or_default();
-            *MIRROR_LIST_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(r);
-            *MIRROR_COLLS_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() =
-                Some(colls);
-        });
+            move || mirror::fetch_collections(&base2).unwrap_or_default(),
+        );
     }
 
     fn download_mirror(&mut self, mm: MirrorMod) {
@@ -1244,13 +1325,14 @@ impl App {
         };
         self.smapi_busy = true;
         self.status = "正在下载并安装 SMAPI…".to_string();
-        std::thread::spawn(move || {
-            let msg = match installer::install_smapi(&game_path) {
+        spawn_bg(
+            SMAPI_RESULT.get_or_init(|| Mutex::new(None)),
+            "后台任务异常终止，请重试".to_string(),
+            move || match installer::install_smapi(&game_path) {
                 Ok(m) => m,
                 Err(e) => format!("SMAPI 安装失败：{e}"),
-            };
-            *SMAPI_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(msg);
-        });
+            },
+        );
     }
 }
 
@@ -3816,61 +3898,66 @@ impl App {
         self.host_busy = true;
         self.host_msg.clear();
         self.status = format!("正在部署房主助手并启动游戏（存档 {save}）…");
-        std::thread::spawn(move || {
-            let msg = match run_host_start(&game, &cfg, &save) {
+        spawn_bg(
+            HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)),
+            "后台任务异常终止，请重试".to_string(),
+            move || match run_host_start(&game, &cfg, &save) {
                 Ok(m) => m,
                 Err(e) => format!("开服失败：{e}"),
-            };
-            *HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(msg);
-        });
+            },
+        );
     }
 
     fn vnt_install(&mut self) {
         self.host_busy = true;
         self.status = "正在从 GitHub 下载 vnt…".to_string();
-        std::thread::spawn(|| {
-            let msg = match server::vnt_download() {
+        spawn_bg(
+            HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)),
+            "后台任务异常终止，请重试".to_string(),
+            || match server::vnt_download() {
                 Ok(p) => format!("vnt 已就绪：{}", p.display()),
                 Err(e) => format!("vnt 下载失败：{e}"),
-            };
-            *HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(msg);
-        });
+            },
+        );
     }
 
     fn vnt_start(&mut self) {
         let opt = self.settings.vnt.clone();
         self.host_busy = true;
         self.status = "正在启动 vnt 隧道（请在 UAC 弹窗点「是」）…".to_string();
-        std::thread::spawn(move || {
-            let msg = match server::vnt_start(&opt) {
+        spawn_bg(
+            HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)),
+            "后台任务异常终止，请重试".to_string(),
+            move || match server::vnt_start(&opt) {
                 Ok(()) => "已启动 vnt，隧道建立中（约 3~5 秒后虚拟 IP 会出现）".to_string(),
                 Err(e) => format!("vnt 启动失败：{e}"),
-            };
-            *HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(msg);
-        });
+            },
+        );
     }
 
     fn vnt_stop(&mut self) {
         self.host_busy = true;
         self.status = "正在断开 vnt 隧道…".to_string();
-        std::thread::spawn(|| {
-            let msg = match server::vnt_stop() {
+        spawn_bg(
+            HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)),
+            "后台任务异常终止，请重试".to_string(),
+            || match server::vnt_stop() {
                 Ok(()) => "已断开 vnt 隧道".to_string(),
                 Err(e) => format!("断开失败：{e}"),
-            };
-            *HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(msg);
-        });
+            },
+        );
     }
 
     fn allow_firewall(&mut self) {
         self.status = "正在添加防火墙放行规则（请在 UAC 弹窗点「是」）…".to_string();
-        std::thread::spawn(|| {
-            let msg = match server::allow_firewall(server::GAME_PORT) {
+        spawn_bg(
+            HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)),
+            "后台任务异常终止，请重试".to_string(),
+            || match server::allow_firewall(server::GAME_PORT) {
                 Ok(()) => format!("已放行 UDP {} 端口", server::GAME_PORT),
                 Err(e) => format!("放行失败：{e}"),
-            };
-            *HOST_MSG_RESULT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(msg);
-        });
+            },
+        );
     }
 
     /// 指令很轻（写一个小文件），直接同步发。
@@ -4191,13 +4278,13 @@ impl App {
                                     self.peer_mods_loading = true;
                                     self.peer_mods_error = None;
                                     self.peer_mods.clear();
-                                    std::thread::spawn(move || {
-                                        let r = p2p::fetch_peer_mods(&ip).map_err(|e| e.to_string());
-                                        *PEER_MODS_RESULT
-                                            .get_or_init(|| Mutex::new(None))
-                                            .lock()
-                                            .unwrap() = Some(r);
-                                    });
+                                    spawn_bg(
+                                        PEER_MODS_RESULT.get_or_init(|| Mutex::new(None)),
+                                        Err("后台任务异常终止，请重试".to_string()),
+                                        move || {
+                                            p2p::fetch_peer_mods(&ip).map_err(|e| e.to_string())
+                                        },
+                                    );
                                 }
                             }
                             if liquid::soft_button(ui, "删除", liquid::DANGER, liquid::DANGER_SOFT).clicked() {
@@ -4490,24 +4577,28 @@ impl App {
                     let mp = mods_path.clone();
                     let ml2 = ml.clone();
                     std::thread::spawn(move || {
-                        let (ok, fail) = p2p::fill_missing(
-                            &ip2,
-                            &ml2,
-                            source,
-                            &mu,
-                            &mp,
-                            &|i, total, msg| {
-                                *SYNC_PROGRESS_RESULT
-                                    .get_or_init(|| Mutex::new(None))
-                                    .lock()
-                                    .unwrap() = Some((
-                                    format!("({i}/{total}) {msg}"),
-                                    false,
-                                    0,
-                                    0,
-                                ));
-                            },
-                        );
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            p2p::fill_missing(
+                                &ip2,
+                                &ml2,
+                                source,
+                                &mu,
+                                &mp,
+                                &|i, total, msg| {
+                                    *SYNC_PROGRESS_RESULT
+                                        .get_or_init(|| Mutex::new(None))
+                                        .lock()
+                                        .unwrap() = Some((
+                                        format!("({i}/{total}) {msg}"),
+                                        false,
+                                        0,
+                                        0,
+                                    ));
+                                },
+                            )
+                        }));
+                        // 线程内 panic 也要落「完成」标记，否则 sync_busy 永久卡住。
+                        let (ok, fail) = r.unwrap_or((0, 0));
                         *SYNC_PROGRESS_RESULT
                             .get_or_init(|| Mutex::new(None))
                             .lock()

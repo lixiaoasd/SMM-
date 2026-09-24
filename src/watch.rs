@@ -362,7 +362,12 @@ fn process_queue() {
             st.queue.pop_front()
         };
         let Some(id) = id else { return };
-        install_job(id);
+        // 兜底 panic：否则监控线程会静默死掉，之后浏览器下载再也不会被接管。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install_job(id)));
+        if r.is_err() {
+            log_line(&format!("安装任务 panic（id={id}），已标记为失败"));
+            finish(id, false, "安装任务异常终止，请重试".to_string());
+        }
     }
 }
 

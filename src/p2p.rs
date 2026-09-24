@@ -1,13 +1,15 @@
-//! P2P 联机大厅：登录 / 好友 / 模组传送。
+//! P2P 联机大厅：登录 / 好友 / 按需拉取好友模组。
 //!
 //! 基于 vnt 虚拟局域网，无需中央服务器：
-//!   - 内嵌 HTTP 服务器（端口 8772）：对外提供 `/profile`、`/mods`、`/mods/<folder>`
+//!   - 内嵌 HTTP 服务器（端口 8772，**只读**）：`/profile`、`/mods`、`/mods/<folder>`
 //!   - UDP 广播（端口 8773）：发现同网段的在线玩家
-//!   - P2P 客户端：拉取好友档案、浏览共享模组、下载/推送模组
+//!   - P2P 客户端：拉取好友档案、浏览共享模组、下载缺失模组
 //!
 //! 「登录」= 创建本地档案（昵称 + 自动生成 UID），「上线」= 启动 P2P 服务 + 广播存在。
 //! 「好友」= 本地持久化 UID 列表，在 vnt 同网段发现时自动标记在线。
-//! 「传送模组」= HTTP 直传 zip，接收方自动解压到 Mods 目录。
+//!
+//! 服务器不提供任何写入接口：同网段任何人都能访问它，一旦允许推送 zip 就等于
+//! 允许对方往 Mods 里塞 DLL（模组即代码）。补齐模组一律由**本机主动拉取**。
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -202,6 +204,18 @@ pub fn save_friends(f: &[Friend]) -> Result<()> {
 
 /// 扫描 Mods 目录，返回可共享的模组列表（跳过隐藏/禁用的）。
 pub fn list_shared_mods(mods_path: &Path) -> Vec<SharedMod> {
+    scan_mods(mods_path, false)
+}
+
+/// 本地模组清单（**含已禁用**的 `.` 前缀目录），仅用于「好友模组对比」。
+///
+/// 禁用只代表没启用、不代表没有。若对比时把禁用的模组排除在外，它会被
+/// 判成「缺失」并被重新下载安装，甚至在 Mods 里留下「.X 与 X」两份同名模组。
+pub fn list_local_mods(mods_path: &Path) -> Vec<SharedMod> {
+    scan_mods(mods_path, true)
+}
+
+fn scan_mods(mods_path: &Path, include_disabled: bool) -> Vec<SharedMod> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(mods_path) else {
         return out;
@@ -211,8 +225,12 @@ pub fn list_shared_mods(mods_path: &Path) -> Vec<SharedMod> {
         if !path.is_dir() {
             continue;
         }
-        let folder = entry.file_name().to_string_lossy().to_string();
-        if folder.starts_with('.') {
+        let raw = entry.file_name().to_string_lossy().to_string();
+        let (folder, disabled) = match raw.strip_prefix('.') {
+            Some(rest) if !rest.is_empty() => (rest.to_string(), true),
+            _ => (raw, false),
+        };
+        if disabled && !include_disabled {
             continue;
         }
         let (name, version, author, unique_id) =
@@ -277,27 +295,6 @@ fn zip_folder(src: &Path) -> Result<Vec<u8>> {
     }
     let cursor = zw.finish()?;
     Ok(cursor.into_inner())
-}
-
-/// 把 zip 数据解压到目标目录（安全：拒绝 .. 和绝对路径）。
-pub fn extract_zip(zip_data: &[u8], dest: &Path) -> Result<()> {
-    let cursor = std::io::Cursor::new(zip_data);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
-        let joined = sanitize_join(dest, &name)?;
-        if file.is_dir() {
-            std::fs::create_dir_all(&joined)?;
-        } else {
-            if let Some(parent) = joined.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut out = std::fs::File::create(&joined)?;
-            std::io::copy(&mut file, &mut out)?;
-        }
-    }
-    Ok(())
 }
 
 fn sanitize_join(base: &Path, rel: &str) -> Result<PathBuf> {
@@ -370,7 +367,44 @@ pub fn stop_server() {
     }
 }
 
-fn handle_http(stream: TcpStream, mods_path: &Path, profile: &Profile) -> Result<()> {
+/// 请求行 / 单个请求头的长度上限：对端一直不发换行也不会把内存撑爆。
+const MAX_LINE: usize = 8 * 1024;
+
+/// 带上限地读一行；超限直接报错断开连接。
+fn read_line_limited(reader: &mut impl BufRead, out: &mut String) -> std::io::Result<()> {
+    let n = reader.by_ref().take(MAX_LINE as u64).read_line(out)?;
+    if n >= MAX_LINE && !out.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "请求行/请求头过长",
+        ));
+    }
+    Ok(())
+}
+
+/// 写一个完整响应（HTTP/1.0 + CORS 头）。
+fn respond(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.0 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: *\r\n\
+         \r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    Ok(())
+}
+
+fn handle_http(mut stream: TcpStream, mods_path: &Path, profile: &Profile) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
 
@@ -378,36 +412,22 @@ fn handle_http(stream: TcpStream, mods_path: &Path, profile: &Profile) -> Result
 
     // 读请求行
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    read_line_limited(&mut reader, &mut request_line)?;
     let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
     let method = parts.first().copied().unwrap_or("");
     let path = parts.get(1).copied().unwrap_or("/");
 
-    // 读 headers
-    let mut content_length = 0usize;
+    // 读 headers（只用于跳过，本服务没有 POST 路由，不解析 content-length；
+    // 请求体也一律不读——留着它就会成为「声明超大 Content-Length 打爆内存」的口子）。
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        read_line_limited(&mut reader, &mut line)?;
         if line.trim().is_empty() {
             break;
         }
-        if line.to_lowercase().starts_with("content-length:") {
-            content_length = line
-                .split(':')
-                .nth(1)
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
-        }
     }
 
-    // 读 POST body
-    let mut body = Vec::new();
-    if method == "POST" && content_length > 0 {
-        body = vec![0u8; content_length];
-        reader.read_exact(&mut body)?;
-    }
-
-    // 路由
+    // 路由（只读接口：档案 / 模组清单 / 单个模组 zip）。
     let (status, content_type, response_body): (&str, &str, Vec<u8>) = match (method, path) {
         ("GET", "/") | ("GET", "/profile") => {
             let json = serde_json::to_string(profile).unwrap_or_default();
@@ -435,20 +455,6 @@ fn handle_http(stream: TcpStream, mods_path: &Path, profile: &Profile) -> Result
                 _ => ("404 Not Found", "text/plain", b"Not found".to_vec()),
             }
         }
-        ("POST", "/receive-mod") => {
-            if body.is_empty() {
-                ("400 Bad Request", "text/plain", b"Empty body".to_vec())
-            } else {
-                match extract_zip(&body, mods_path) {
-                    Ok(()) => ("200 OK", "text/plain", b"Received".to_vec()),
-                    Err(e) => (
-                        "500 Internal Server Error",
-                        "text/plain",
-                        e.to_string().into_bytes(),
-                    ),
-                }
-            }
-        }
         ("OPTIONS", _) => {
             // CORS preflight
             (
@@ -461,19 +467,7 @@ fn handle_http(stream: TcpStream, mods_path: &Path, profile: &Profile) -> Result
     };
 
     // 发响应
-    let header = format!(
-        "HTTP/1.0 {status}\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
-         \r\n",
-        response_body.len()
-    );
-    let mut stream = stream;
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(&response_body)?;
+    respond(&mut stream, status, content_type, &response_body)?;
 
     Ok(())
 }
@@ -596,39 +590,23 @@ pub fn fetch_peer_mods(ip: &str) -> Result<Vec<SharedMod>> {
 
 /// 从好友处下载模组并自动安装到 Mods 目录。
 pub fn download_mod_from_peer(ip: &str, folder: &str, mods_path: &Path) -> Result<String> {
+    let data = fetch_mod_bytes_from_peer(ip, folder)?;
+    // 统一走 installer：带全局安装锁，不会与镜像直装/浏览器监控并发写 Mods。
+    crate::installer::install_zip_bytes(&data, mods_path)?;
+    Ok(format!("「{folder}」已从 {ip} 下载并安装"))
+}
+
+/// 从好友处取回模组 zip 字节（只读，不落盘、不安装）。
+///
+/// 单独拆出来是给「好友 + 镜像竞速」用的：两条线程只负责取字节，
+/// 由调用方在拿到第一个成功结果后安装一次，避免两边各解压一遍互相覆盖。
+fn fetch_mod_bytes_from_peer(ip: &str, folder: &str) -> Result<Vec<u8>> {
     let url = format!("http://{ip}:{P2P_PORT}/mods/{folder}");
     let resp = client().get(&url).send()?;
     if !resp.status().is_success() {
         return Err(anyhow!("HTTP {}", resp.status()));
     }
-    let data = resp.bytes()?.to_vec();
-    extract_zip(&data, mods_path)?;
-    Ok(format!("「{folder}」已从 {ip} 下载并安装"))
-}
-
-/// 把本地模组推送给好友。
-pub fn send_mod_to_peer(ip: &str, folder: &str, mods_path: &Path) -> Result<String> {
-    let src = mods_path.join(folder);
-    if !src.is_dir() {
-        return Err(anyhow!("模组文件夹不存在：{folder}"));
-    }
-    let zip_data = zip_folder(&src)?;
-    let url = format!("http://{ip}:{P2P_PORT}/receive-mod");
-    let sender = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(5))
-        .build()?;
-    let resp = sender
-        .post(&url)
-        .header("Content-Type", "application/zip")
-        .header("X-Mod-Name", folder)
-        .body(zip_data)
-        .send()?;
-    if resp.status().is_success() {
-        Ok(format!("「{folder}」已传送给 {ip}"))
-    } else {
-        Err(anyhow!("传送失败：HTTP {}", resp.status()))
-    }
+    Ok(resp.bytes()?.to_vec())
 }
 
 // ============================================================
@@ -657,26 +635,35 @@ pub struct ModSync {
     pub extra: Vec<SharedMod>,
 }
 
+/// 对比用的模组身份键：优先 UniqueID（同一模组改名/改文件夹都不受影响），
+/// 没有 manifest 的退回文件夹名。
+fn mod_key(m: &SharedMod) -> String {
+    let uid = m.unique_id.trim();
+    if uid.is_empty() {
+        m.folder.trim_start_matches('.').to_lowercase()
+    } else {
+        uid.to_uppercase()
+    }
+}
+
 /// 对比本地与好友的模组列表，找出缺失的。
 pub fn compare_mods(local: &[SharedMod], peer: &[SharedMod]) -> ModSync {
-    let local_set: std::collections::HashSet<String> =
-        local.iter().map(|m| m.folder.to_lowercase()).collect();
-    let peer_set: std::collections::HashSet<String> =
-        peer.iter().map(|m| m.folder.to_lowercase()).collect();
+    let local_set: std::collections::HashSet<String> = local.iter().map(mod_key).collect();
+    let peer_set: std::collections::HashSet<String> = peer.iter().map(mod_key).collect();
 
     let missing = peer
         .iter()
-        .filter(|m| !local_set.contains(&m.folder.to_lowercase()))
+        .filter(|m| !local_set.contains(&mod_key(m)))
         .cloned()
         .collect();
     let matching = peer
         .iter()
-        .filter(|m| local_set.contains(&m.folder.to_lowercase()))
+        .filter(|m| local_set.contains(&mod_key(m)))
         .cloned()
         .collect();
     let extra = local
         .iter()
-        .filter(|m| !peer_set.contains(&m.folder.to_lowercase()))
+        .filter(|m| !peer_set.contains(&mod_key(m)))
         .cloned()
         .collect();
 
@@ -690,12 +677,11 @@ struct MirrorEntry {
     file: String,
 }
 
-/// 从镜像服务器下载模组并安装。
-pub fn download_from_mirror(
+/// 从镜像服务器取回模组 zip 字节（只读，不落盘、不安装）。
+fn fetch_mod_bytes_from_mirror(
     folder: &str,
     mirror_url: &str,
-    mods_path: &Path,
-) -> Result<String> {
+) -> Result<(String, Vec<u8>)> {
     let base = mirror_url.trim_end_matches('/');
     let index_url = format!("{base}/index.json");
     let resp = client().get(&index_url).send()?;
@@ -707,21 +693,33 @@ pub fn download_from_mirror(
     let found = entries
         .iter()
         .find(|e| e.name.eq_ignore_ascii_case(folder));
-    if let Some(m) = found {
-        let file_url = format!("{base}/{}", m.file);
-        let resp2 = client().get(&file_url).send()?;
-        if !resp2.status().is_success() {
-            return Err(anyhow!("下载失败（HTTP {}）", resp2.status()));
-        }
-        let data = resp2.bytes()?.to_vec();
-        extract_zip(&data, mods_path)?;
-        Ok(format!("「{}」已从镜像服务器下载并安装", m.name))
-    } else {
-        Err(anyhow!("镜像服务器上找不到「{folder}」"))
+    let Some(m) = found else {
+        return Err(anyhow!("镜像服务器上找不到「{folder}」"));
+    };
+    let file_url = format!("{base}/{}", m.file);
+    let resp2 = client().get(&file_url).send()?;
+    if !resp2.status().is_success() {
+        return Err(anyhow!("下载失败（HTTP {}）", resp2.status()));
     }
+    Ok((m.name.clone(), resp2.bytes()?.to_vec()))
 }
 
-/// 同时从好友和镜像服务器下载，谁先完成用谁。
+/// 从镜像服务器下载模组并安装。
+pub fn download_from_mirror(
+    folder: &str,
+    mirror_url: &str,
+    mods_path: &Path,
+) -> Result<String> {
+    let (name, data) = fetch_mod_bytes_from_mirror(folder, mirror_url)?;
+    crate::installer::install_zip_bytes(&data, mods_path)?;
+    Ok(format!("「{name}」已从镜像服务器下载并安装"))
+}
+
+/// 同时从好友和镜像服务器下载，谁先拿到完整数据用谁。
+///
+/// 两条线程**只负责取字节**，安装由本函数在收到第一个成功结果后做**一次**：
+/// 原实现让两条线程各自解压到 Mods，慢的一方不会停手，会把两个版本的文件
+/// 混在一起（同名后写赢、独有文件两边都留下），且绕过了全局安装锁。
 fn download_from_both(
     ip: &str,
     folder: &str,
@@ -729,50 +727,47 @@ fn download_from_both(
     mods_path: &Path,
 ) -> Result<String> {
     use std::sync::mpsc;
-    let (tx, rx) = mpsc::channel();
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let (tx, rx) = mpsc::channel::<(&'static str, Result<Vec<u8>>)>();
 
     // 线程 1：好友
     let tx1 = tx.clone();
-    let done1 = done.clone();
     let ip1 = ip.to_string();
     let folder1 = folder.to_string();
-    let mp1 = mods_path.to_path_buf();
     std::thread::spawn(move || {
-        let r = download_mod_from_peer(&ip1, &folder1, &mp1);
-        if done1.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let r = fetch_mod_bytes_from_peer(&ip1, &folder1);
         let _ = tx1.send(("friend", r));
     });
 
     // 线程 2：镜像服务器
     let tx2 = tx.clone();
-    let done2 = done.clone();
     let folder2 = folder.to_string();
     let url2 = mirror_url.to_string();
-    let mp2 = mods_path.to_path_buf();
     std::thread::spawn(move || {
-        let r = download_from_mirror(&folder2, &url2, &mp2);
-        if done2.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let r = fetch_mod_bytes_from_mirror(&folder2, &url2).map(|(_, data)| data);
         let _ = tx2.send(("mirror", r));
     });
 
-    drop(tx); // 关闭发送端，使 rx 在所有线程结束后自动返回 Err
+    drop(tx); // 关闭发送端：两个线程都结束后 recv 会返回 Disconnected
 
-    match rx.recv_timeout(Duration::from_secs(120)) {
-        Ok((source, Ok(msg))) => Ok(format!("[{source}] {msg}")),
-        Ok((_, Err(_))) => {
-            // 第一个失败，等第二个
-            match rx.recv_timeout(Duration::from_secs(120)) {
-                Ok((source, Ok(msg))) => Ok(format!("[{source}] {msg}")),
-                Ok((_, Err(e))) => Err(anyhow!("两个下载源都失败了。{e}")),
-                Err(_) => Err(anyhow!("下载超时")),
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut last_err = String::new();
+    loop {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remain) {
+            Ok((source, Ok(data))) => {
+                // 安装失败（拿到的是坏包）时继续等另一个来源，别把这次补齐直接判死。
+                match crate::installer::install_zip_bytes(&data, mods_path) {
+                    Ok(_) => return Ok(format!("[{source}] 「{folder}」已下载并安装")),
+                    Err(e) => last_err = format!("{source} 安装失败：{e}"),
+                }
+            }
+            Ok((_, Err(e))) => last_err = e.to_string(),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(anyhow!("下载超时")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("两个下载源都失败了。{last_err}"))
             }
         }
-        Err(_) => Err(anyhow!("下载超时")),
     }
 }
 

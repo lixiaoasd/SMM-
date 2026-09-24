@@ -1,6 +1,6 @@
 [package]
 name = "stardew-mod-manager"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "星露谷物语模组管理器 — Stardew Valley mod manager"
 license = "MIT"

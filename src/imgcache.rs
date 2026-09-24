@@ -16,6 +16,68 @@ use std::sync::{Mutex, OnceLock};
 const MAX_W: u32 = 560;
 /// 内存中同时保留的纹理数（LRU）。
 const MEM_LIMIT: usize = 256;
+/// 取图 worker 数量。
+///
+/// 原实现是「每张未命中图片各起一个线程 + 各建一个 HTTP Client」：快速滚动
+/// 几千条的模组清单时会瞬间拉起上百个线程和连接池。改成固定小线程池 +
+/// 共享 Client，并发上限可控。
+const WORKERS: usize = 4;
+
+/// 取图任务：(图片 URL, 缓存 key, egui 上下文)。
+type Job = (String, String, Context);
+
+static JOBS: OnceLock<std::sync::mpsc::Sender<Job>> = OnceLock::new();
+static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+fn client() -> &'static reqwest::blocking::Client {
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent("StardewModManager")
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
+}
+
+/// 懒启动固定数量的取图 worker，返回任务队列发送端。
+fn jobs() -> &'static std::sync::mpsc::Sender<Job> {
+    JOBS.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = std::sync::Arc::new(Mutex::new(rx));
+        for _ in 0..WORKERS {
+            let rx = rx.clone();
+            std::thread::spawn(move || loop {
+                // 只在等待取任务时持锁，取到立即释放。
+                let job = {
+                    let guard = rx.lock().unwrap();
+                    guard.recv()
+                };
+                let Ok((url, key, ctx)) = job else { return };
+                let result = load_and_decode(&url, &key);
+                let mut st = store().lock().unwrap();
+                match result {
+                    Some(img) => {
+                        let tex = ctx.load_texture(
+                            format!("mirror-img:{key}"),
+                            img,
+                            TextureOptions::LINEAR,
+                        );
+                        st.map.insert(key.clone(), Slot::Ready(tex));
+                        touch_lru(&mut st, &key);
+                        evict(&mut st);
+                    }
+                    None => {
+                        st.map.insert(key.clone(), Slot::Failed);
+                    }
+                }
+                drop(st);
+                ctx.request_repaint();
+            });
+        }
+        tx
+    })
+}
 
 enum Slot {
     Loading,
@@ -97,30 +159,7 @@ fn request_url(ctx: &Context, url: &str, key: &str) -> ImgState {
         st.lru.push_front(key.to_string());
     }
 
-    let ctx = ctx.clone();
-    let url = url.to_string();
-    let key_owned = key.to_string();
-    std::thread::spawn(move || {
-        let result = load_and_decode(&url, &key_owned);
-        let mut st = store().lock().unwrap();
-        match result {
-            Some(img) => {
-                let tex = ctx.load_texture(
-                    format!("mirror-img:{key_owned}"),
-                    img,
-                    TextureOptions::LINEAR,
-                );
-                st.map.insert(key_owned.clone(), Slot::Ready(tex));
-                touch_lru(&mut st, &key_owned);
-                evict(&mut st);
-            }
-            None => {
-                st.map.insert(key_owned.clone(), Slot::Failed);
-            }
-        }
-        drop(st);
-        ctx.request_repaint();
-    });
+    let _ = jobs().send((url.to_string(), key.to_string(), ctx.clone()));
 
     ImgState::Loading
 }
@@ -149,13 +188,7 @@ fn load_and_decode(url: &str, key: &str) -> Option<ColorImage> {
     let bytes = match std::fs::read(&dp) {
         Ok(b) if !b.is_empty() => b,
         _ => {
-            let client = reqwest::blocking::Client::builder()
-                .user_agent("StardewModManager")
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .ok()?;
-            let mut resp = client.get(url).send().ok()?;
+            let mut resp = client().get(url).send().ok()?;
             if !resp.status().is_success() {
                 return None;
             }

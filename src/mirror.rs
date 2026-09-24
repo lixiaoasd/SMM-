@@ -88,9 +88,9 @@ pub fn fetch_index(base: &str) -> Result<Vec<MirrorMod>, String> {
     if !resp.status().is_success() {
         return Err(format!("镜像源返回 HTTP {}", resp.status()));
     }
-    let text = resp.text().map_err(|e| e.to_string())?;
+    // 直接从响应流解析，避免再多留一份 ~20MB 的中间 String。
     let list: Vec<MirrorMod> =
-        serde_json::from_str(&text).map_err(|e| format!("index.json 解析失败：{e}"))?;
+        serde_json::from_reader(resp).map_err(|e| format!("index.json 解析失败：{e}"))?;
     Ok(list)
 }
 
@@ -131,9 +131,8 @@ pub fn fetch_collections(base: &str) -> Result<Vec<MirrorCollection>, String> {
     if !resp.status().is_success() {
         return Err(format!("镜像源返回 HTTP {}", resp.status()));
     }
-    let text = resp.text().map_err(|e| e.to_string())?;
     let list: Vec<MirrorCollection> =
-        serde_json::from_str(&text).map_err(|e| format!("collections.json 解析失败：{e}"))?;
+        serde_json::from_reader(resp).map_err(|e| format!("collections.json 解析失败：{e}"))?;
     Ok(list)
 }
 
@@ -284,7 +283,16 @@ pub fn download(base: String, mm: MirrorMod) {
         });
         (id, cancel)
     };
-    std::thread::spawn(move || run_job(id, cancel, base, mm));
+    std::thread::spawn(move || {
+        // 线程 panic 若不兜底，这条任务会永远停在「下载中」，行内按钮永久禁用。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_job(id, cancel, base, mm)
+        }));
+        if r.is_err() {
+            log_line(&format!("[{id}] 任务 panic，已标记为失败"));
+            set_state(id, MState::Finished(false, "任务异常终止，请重试".to_string()));
+        }
+    });
 }
 
 fn display_title(mm: &MirrorMod) -> String {
@@ -313,100 +321,126 @@ fn run_job(id: u64, cancel: Arc<AtomicBool>, base: String, mm: MirrorMod) {
     set_title(id, display_title(&mm));
     log_line(&format!("[{id}] GET {url}"));
 
-    let result = (|| -> Result<(PathBuf, Vec<String>), String> {
-        let mods_dir = MODS_DIR
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "未配置 Mods 目录（设置页指定游戏路径）".to_string())?;
+    let mods_dir = match MODS_DIR.lock().unwrap().clone() {
+        Some(d) => d,
+        None => {
+            let msg = "未配置 Mods 目录（设置页指定游戏路径）".to_string();
+            log_line(&format!("[{id}] failed: {msg}"));
+            set_state(id, MState::Finished(false, msg));
+            return;
+        }
+    };
 
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("StardewModManager")
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(1800))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut resp = client
-            .get(&url)
-            .send()
-            .map_err(|e| format!("下载请求失败：{e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("镜像源返回 HTTP {}", resp.status()));
-        }
-        let total = resp.content_length().unwrap_or(mm.size);
-        if let Some(j) = store().lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
-            j.total = total;
-        }
+    // 暂存路径先算出来：下载中途失败也要能清理掉半截文件
+    //（原来只在「成功」和「取消」两条路径删除，出错会把残包留在 mirror-downloads）。
+    let dl_dir = crate::model::config_dir().join("mirror-downloads");
+    let fname = mm
+        .file
+        .replace('/', "_")
+        .replace('\\', "_")
+        .trim_start_matches("mods_")
+        .to_string();
+    let tmp = dl_dir.join(if fname.ends_with(".zip") {
+        fname
+    } else {
+        format!("{fname}.zip")
+    });
 
-        // 暂存到 %APPDATA%\StardewModManager\mirror-downloads。
-        let dl_dir = crate::model::config_dir().join("mirror-downloads");
-        std::fs::create_dir_all(&dl_dir).map_err(|e| e.to_string())?;
-        let fname = mm
-            .file
-            .replace('/', "_")
-            .replace('\\', "_")
-            .trim_start_matches("mods_")
-            .to_string();
-        let tmp = dl_dir.join(if fname.ends_with(".zip") {
-            fname
-        } else {
-            format!("{fname}.zip")
-        });
-        let mut out = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
-
-        // blocking::Response 实现了 Read：64KB 一块流式写，可随时取消。
-        let mut buf = [0u8; 64 * 1024];
-        let mut done: u64 = 0;
-        let mut last_ui = Instant::now();
-        loop {
-            if cancel.load(Ordering::SeqCst) {
-                return Err("已取消".to_string());
-            }
-            let n = match resp.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("读取数据流失败：{e}")),
-            };
-            out.write_all(&buf[..n]).map_err(|e| format!("写入失败：{e}"))?;
-            done += n as u64;
-            if last_ui.elapsed() >= Duration::from_millis(200) {
-                if let Some(j) =
-                    store().lock().unwrap().jobs.iter_mut().find(|j| j.id == id)
-                {
-                    j.done = done;
-                }
-                last_ui = Instant::now();
-            }
-        }
-        out.flush().ok();
-        drop(out);
-        if let Some(j) = store().lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
-            j.done = done;
-        }
-        if cancel.load(Ordering::SeqCst) {
+    let downloaded = download_to_file(id, &cancel, &url, &dl_dir, &tmp, mm.size);
+    let done = match downloaded {
+        Ok(d) => d,
+        Err(e) => {
             let _ = std::fs::remove_file(&tmp);
-            return Err("已取消".to_string());
+            log_line(&format!("[{id}] failed: {e}"));
+            set_state(id, MState::Finished(false, e));
+            return;
         }
-
-        set_state(id, MState::Installing);
-        log_line(&format!("[{id}] downloaded {} bytes, installing", done));
-        let names = crate::installer::install_archive(&tmp, &mods_dir)
-            .map_err(|e| format!("安装失败：{e}（压缩包已保留）"))?;
+    };
+    if cancel.load(Ordering::SeqCst) {
         let _ = std::fs::remove_file(&tmp);
-        Ok((tmp, names))
-    })();
+        set_state(id, MState::Finished(false, "已取消".to_string()));
+        return;
+    }
 
-    match result {
-        Ok((_, names)) => {
+    set_state(id, MState::Installing);
+    log_line(&format!("[{id}] downloaded {done} bytes, installing"));
+    match crate::installer::install_archive(&tmp, &mods_dir) {
+        Ok(names) => {
+            let _ = std::fs::remove_file(&tmp);
             log_line(&format!("[{id}] installed: {}", names.join("、")));
             set_state(id, MState::Finished(true, format!("已安装：{}", names.join("、"))));
         }
         Err(e) => {
-            log_line(&format!("[{id}] failed: {e}"));
-            set_state(id, MState::Finished(false, e));
+            // 安装失败保留压缩包，便于排查。
+            let msg = format!("安装失败：{e}（压缩包已保留）");
+            log_line(&format!("[{id}] failed: {msg}"));
+            set_state(id, MState::Finished(false, msg));
         }
     }
+}
+
+/// 流式下载到 `tmp`，返回写出的字节数。
+///
+/// 出错时**不**清理文件，交给调用方在统一的失败路径删除（保证所有错误分支都清干净）。
+fn download_to_file(
+    id: u64,
+    cancel: &AtomicBool,
+    url: &str,
+    dl_dir: &std::path::Path,
+    tmp: &std::path::Path,
+    fallback_total: u64,
+) -> Result<u64, String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("StardewModManager")
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(1800))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("下载请求失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("镜像源返回 HTTP {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(fallback_total);
+    if let Some(j) = store().lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
+        j.total = total;
+    }
+
+    std::fs::create_dir_all(dl_dir).map_err(|e| e.to_string())?;
+    let mut out = std::fs::File::create(tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
+
+    // blocking::Response 实现了 Read：64KB 一块流式写，可随时取消。
+    let mut buf = [0u8; 64 * 1024];
+    let mut done: u64 = 0;
+    let mut last_ui = Instant::now();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("已取消".to_string());
+        }
+        let n = match resp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("读取数据流失败：{e}")),
+        };
+        out.write_all(&buf[..n]).map_err(|e| format!("写入失败：{e}"))?;
+        done += n as u64;
+        if last_ui.elapsed() >= Duration::from_millis(200) {
+            if let Some(j) = store().lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
+                j.done = done;
+            }
+            last_ui = Instant::now();
+        }
+    }
+    out.flush().ok();
+    // 必须在删除文件前释放句柄（Windows 下打开的文件无法删除）。
+    drop(out);
+    if let Some(j) = store().lock().unwrap().jobs.iter_mut().find(|j| j.id == id) {
+        j.done = done;
+    }
+    Ok(done)
 }
 
 /// 诊断日志：%APPDATA%\StardewModManager\mirror.log（append）。

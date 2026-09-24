@@ -86,6 +86,24 @@ pub fn install_archive(archive: &Path, mods_dir: &Path) -> Result<Vec<String>> {
     Ok(installed)
 }
 
+/// 从内存中的 zip 数据安装（P2P 补齐 / 镜像补齐用）。
+///
+/// 先落一个独占临时文件再走 `install_archive` 的统一流程，好处是复用
+/// 全局安装锁与 zip slip 校验——直接 `extract_zip` 到 Mods 会绕过安装锁，
+/// 与镜像直装/浏览器监控并发时互相覆盖。
+pub fn install_zip_bytes(data: &[u8], mods_dir: &Path) -> Result<Vec<String>> {
+    let seq = EXTRACT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!(
+        "stardew_p2p_{}_{}.zip",
+        std::process::id(),
+        seq
+    ));
+    std::fs::write(&tmp, data)?;
+    let r = install_archive(&tmp, mods_dir);
+    let _ = std::fs::remove_file(&tmp);
+    r
+}
+
 /// 安全拼接，避免路径穿越。
 fn sanitize_join(base: &Path, rel: &str) -> Result<PathBuf> {
     let clean = rel.replace('\\', "/");
