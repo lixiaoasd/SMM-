@@ -49,6 +49,30 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 调试入口：--install-smoke <zip 路径> [Mods 目录]
+    // 直接对指定压缩包跑一遍「直装」用的 install_archive，验证安装链路
+    // （默认装到临时目录，不污染真实 Mods）。需要 debug 构建才能看到输出。
+    if args.len() >= 3 && args[1] == "--install-smoke" {
+        let zip = std::path::PathBuf::from(&args[2]);
+        let mods = match args.get(3) {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                let d = std::env::temp_dir()
+                    .join(format!("stardew_install_smoke_{}", std::process::id()))
+                    .join("Mods");
+                let _ = std::fs::create_dir_all(&d);
+                d
+            }
+        };
+        println!("压缩包：{}", zip.display());
+        println!("Mods 目录：{}", mods.display());
+        match installer::install_archive(&zip, &mods) {
+            Ok(names) => println!("结果：OK —— 安装了 {} 个模组：{}", names.len(), names.join("、")),
+            Err(e) => println!("结果：FAILED —— {e}"),
+        }
+        return Ok(());
+    }
+
     // 调试入口：--files-smoke <mod_id>，直接验证 nexus_mod_files + 主文件选择。
     if args.len() >= 3 && args[1] == "--files-smoke" {
         let settings = model::Settings::load();
