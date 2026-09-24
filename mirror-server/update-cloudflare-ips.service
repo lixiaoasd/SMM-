@@ -1,8 +1,0 @@
-[Unit]
-Description=Refresh Cloudflare origin IP list for nginx (FireSVM mirror)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/update-cloudflare-ips.sh

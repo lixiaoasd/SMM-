@@ -5,9 +5,11 @@ use std::path::PathBuf;
 
 /// 默认镜像源：云端模组库（朋友开箱即用，无需自建服务器）。
 ///
-/// 走 Cloudflare 代理的 HTTPS 域名。源站已不再对公网开放 80，
-/// 所以自建镜像时也要填 https 地址；本地调试可在设置页改为 http://localhost:8770。
-pub const DEFAULT_MIRROR_URL: &str = "https://smmsever.xyz";
+/// 目前仍是源站 IP 直连（HTTP）。域名 smmsever.xyz 正在走 ICP 备案，
+/// 服务器在阿里云大陆节点，未备案域名绑大陆服务器会被阻断；
+/// 备案通过、HTTPS 就绪后再把这里换成 https 域名。
+/// 自建镜像时可在设置页改为 http://localhost:8770 等地址。
+pub const DEFAULT_MIRROR_URL: &str = "http://116.62.231.162";
 
 /// SMAPI 模组的 manifest.json 结构（仅取用到的字段）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
