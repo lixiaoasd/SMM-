@@ -51,6 +51,24 @@ pub fn install_archive(archive: &Path, mods_dir: &Path) -> Result<Vec<String>> {
     // 找出包含 manifest.json 的目录作为“模组根”。
     let roots = find_mod_roots(&tmp);
     if roots.is_empty() {
+        // 有的压缩包是「SMAPI 安装器」而不是普通模组（镜像站收录的 SMAPI 条目就是
+        // 官方 SMAPI-x.y.z-installer.zip）：它没有 manifest.json，但带
+        // internal/windows/install.dat。按普通模组装必然失败，这里转到 SMAPI 安装流程。
+        if let Some(dat) = find_smapi_dat(&tmp) {
+            let game = mods_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .filter(|g| looks_like_game_dir(g));
+            let r = match game {
+                Some(g) => install_smapi_dat(&dat, &g).map(|_| vec!["SMAPI".to_string()]),
+                None => Err(anyhow::anyhow!(
+                    "这是 SMAPI 安装包而不是普通模组，且 Mods 目录不在游戏目录下，\
+                     无法定位游戏目录；请改用「设置 → 一键安装/更新 SMAPI」"
+                )),
+            };
+            let _ = std::fs::remove_dir_all(&tmp);
+            return r;
+        }
         // 无 manifest：可能是“汉化覆盖包”（zip 内只有 <模组名>/i18n/zh.json
         // 之类的语言文件，需要合并进已安装的同名模组目录）。
         match try_install_i18n_overlay(&tmp, mods_dir)? {
@@ -283,7 +301,12 @@ fn copy_dir_merge(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 一键安装 SMAPI：下载最新版安装包，解压，调用官方安装器。
+/// 一键安装 / 更新 SMAPI：下载官方安装包 → 解压 → 按 install.dat 覆盖式安装。
+///
+/// 不再调用官方 SMAPI.Installer.exe：它只认 `--install` / `--uninstall`，根本没有
+/// `--game-path` / `--no-prompt`；而且是交互式控制台程序（启动就调 Console.Clear()），
+/// 从 GUI 进程以无控制台方式 spawn 会直接抛 IOException（句柄无效）失败，
+/// 等它读输入还会把界面永久挂住。官方三个启动脚本也都是无参数调用，没有静默接口。
 pub fn install_smapi(game_path: &Path) -> Result<String> {
     // 1) 从 GitHub 获取最新版下载地址。
     let url = crate::web::smapi_latest_release_url()
@@ -293,42 +316,20 @@ pub fn install_smapi(game_path: &Path) -> Result<String> {
     let zip_path = crate::web::download_smapi(&url)
         .map_err(|e| anyhow::anyhow!("下载失败：{}", e))?;
 
-    // 3) 解压到临时目录。
+    // 3) 解压到临时目录，取出 install.dat 并安装。
     let extract = std::env::temp_dir().join(format!("stardew_smapi_{}", std::process::id()));
-    extract_zip(&zip_path, &extract)?;
-
-    // 4) 定位官方安装器（internal/windows/SMAPI.Installer.exe）。
-    let installer_exe = find_smapi_installer(&extract)
-        .ok_or_else(|| anyhow::anyhow!("解压后未找到 SMAPI 安装器"))?;
-
-    // 5) 启动安装器（--no-prompt 非交互 + --install + --game-path）。
-    //    安装器是控制台程序，会在独立控制台窗口运行；真实环境下可正常完成。
-    let dir = installer_exe
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
-    let mut child = std::process::Command::new(&installer_exe)
-        .current_dir(&dir)
-        .args(["--no-prompt", "--install", "--game-path"])
-        .arg(game_path)
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("启动安装器失败：{}", e))?;
-
-    // 等待安装器完成后再清理临时目录（install.dat 等文件在安装过程中需要读取）。
-    let status = child
-        .wait()
-        .map_err(|e| anyhow::anyhow!("等待安装器失败：{}", e))?;
+    let _ = std::fs::remove_dir_all(&extract);
+    let result = (|| -> Result<String> {
+        extract_zip(&zip_path, &extract)?;
+        install_smapi_from_dir(&extract, game_path)
+    })();
 
     let _ = std::fs::remove_dir_all(&extract);
-
-    if status.success() {
-        Ok("SMAPI 安装完成，可在游戏目录看到 StardewModdingAPI.exe".to_string())
-    } else {
-        anyhow::bail!(
-            "SMAPI 安装器异常退出（code {}）",
-            status.code().unwrap_or(-1)
-        );
+    if result.is_ok() {
+        // 装好就不再留这份 40MB 的临时包；失败时保留，方便排查。
+        let _ = std::fs::remove_file(&zip_path);
     }
+    result
 }
 
 /// 解压 zip 到目标目录。
@@ -353,16 +354,119 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 递归查找 SMAPI 安装器 exe。
-fn find_smapi_installer(base: &Path) -> Option<PathBuf> {
+/// 从解压好的 SMAPI 安装包目录里找出 install.dat 并安装。
+pub fn install_smapi_from_dir(dir: &Path, game_path: &Path) -> Result<String> {
+    let dat =
+        find_smapi_dat(dir).ok_or_else(|| anyhow::anyhow!("安装包内未找到 install.dat"))?;
+    install_smapi_dat(&dat, game_path)
+}
+
+/// 在解压出的安装包里找 install.dat —— 官方包里 windows/linux/macOS 各有一份，
+/// Windows 版优先。
+fn find_smapi_dat(base: &Path) -> Option<PathBuf> {
+    let mut fallback: Option<PathBuf> = None;
     for entry in walkdir::WalkDir::new(base)
         .into_iter()
         .filter_map(|e| e.ok())
     {
-        if entry.file_type().is_file() && entry.file_name() == "SMAPI.Installer.exe" {
-            return Some(entry.path().to_path_buf());
+        if !entry.file_type().is_file() || entry.file_name() != "install.dat" {
+            continue;
+        }
+        let path = entry.path().to_path_buf();
+        let is_windows = path
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n.eq_ignore_ascii_case("windows"))
+            .unwrap_or(false);
+        if is_windows {
+            return Some(path);
+        }
+        fallback.get_or_insert(path);
+    }
+    fallback
+}
+
+/// 目录是否像星露谷游戏目录（至少要有一个游戏本体文件）。
+fn looks_like_game_dir(game: &Path) -> bool {
+    game.join("Stardew Valley.exe").is_file()
+        || game.join("StardewValley.exe").is_file()
+        || game.join("Stardew Valley.deps.json").is_file()
+}
+
+/// 把 SMAPI 的 install.dat（其实是改了扩展名的 zip）安装进游戏目录。
+///
+/// 复刻官方安装包 README.txt 的 manual install 流程：
+///   ① 解压 install.dat 覆盖到游戏目录；但 `Mods/` 下已存在的内置模组
+///      （ConsoleCommands / SaveBackup，含用户改名成 `.X` 的禁用形态）跳过，
+///      否则会和用户那份重名成两个模组；
+///   ② 保留用户已有的 smapi-internal/config.json（SMAPI 启动会自己补默认值）；
+///   ③ 把游戏目录的 `Stardew Valley.deps.json` 复制成 `StardewModdingAPI.deps.json`。
+pub fn install_smapi_dat(dat: &Path, game_path: &Path) -> Result<String> {
+    if !looks_like_game_dir(game_path) {
+        anyhow::bail!(
+            "{} 不像星露谷游戏目录（找不到 Stardew Valley.exe / Stardew Valley.deps.json）",
+            game_path.display()
+        );
+    }
+
+    let cfg = game_path.join("smapi-internal").join("config.json");
+    let saved_cfg = std::fs::read(&cfg).ok();
+
+    // 安装前先记下 Mods 里已有的模组文件夹（含 `.X` 禁用形态）：install.dat 里带
+    // SMAPI 内置模组（ConsoleCommands / SaveBackup），用户已有同名目录时不能覆盖，
+    // 否则会和用户那份重名成两个模组。
+    //
+    // 必须在循环外一次性快照：zip 的目录条目会先把 `Mods/SaveBackup/` 建出来，
+    // 若在循环里逐条判断「是否已存在」，紧随其后的文件条目就会被自己刚建的目录判成
+    // 「已存在」而整包跳过。
+    let mut existing_mods: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(rd) = std::fs::read_dir(game_path.join("Mods")) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            existing_mods.insert(n.trim_start_matches('.').to_ascii_lowercase());
         }
     }
-    None
+
+    let file = std::fs::File::open(dat)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut written = 0usize;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let name = entry.name().replace('\\', "/");
+        if let Some(rest) = name.strip_prefix("Mods/") {
+            let top = rest.split('/').next().unwrap_or("");
+            if !top.is_empty() && existing_mods.contains(&top.to_ascii_lowercase()) {
+                continue;
+            }
+        }
+        let out_path = sanitize_join(game_path, &name)?;
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            std::fs::write(&out_path, &buf)?;
+            written += 1;
+        }
+    }
+
+    if let Some(bytes) = saved_cfg {
+        std::fs::write(&cfg, bytes)?;
+    }
+
+    let game_deps = game_path.join("Stardew Valley.deps.json");
+    if game_deps.is_file() {
+        std::fs::copy(&game_deps, game_path.join("StardewModdingAPI.deps.json"))?;
+    }
+
+    std::fs::create_dir_all(game_path.join("Mods"))?;
+
+    if !game_path.join("StardewModdingAPI.exe").is_file() {
+        anyhow::bail!("安装后没看到 StardewModdingAPI.exe，安装包可能不完整");
+    }
+    Ok(format!("已写入游戏目录 {written} 个文件"))
 }
 

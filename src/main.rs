@@ -29,6 +29,26 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 调试入口：--smapi-smoke <游戏目录> <install.dat 路径 或 解压好的安装包目录>
+    // 走一遍 SMAPI 覆盖式安装（可以指向假的游戏目录来验证，不会动真实环境）。
+    // 需要 debug 构建：release 是 GUI 子系统，看不到输出。
+    if args.len() >= 4 && args[1] == "--smapi-smoke" {
+        let game = std::path::Path::new(&args[2]);
+        let src = std::path::Path::new(&args[3]);
+        println!("游戏目录：{}", game.display());
+        println!("安装源：{}", src.display());
+        let r = if src.is_dir() {
+            installer::install_smapi_from_dir(src, game)
+        } else {
+            installer::install_smapi_dat(src, game)
+        };
+        match r {
+            Ok(m) => println!("结果：OK —— {m}"),
+            Err(e) => println!("结果：FAILED —— {e}"),
+        }
+        return Ok(());
+    }
+
     // 调试入口：--files-smoke <mod_id>，直接验证 nexus_mod_files + 主文件选择。
     if args.len() >= 3 && args[1] == "--files-smoke" {
         let settings = model::Settings::load();
