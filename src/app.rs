@@ -95,6 +95,22 @@ fn has_id_token(title: &str, id: u32) -> bool {
     false
 }
 
+// ---------- 后台 refresh（避免在 UI 线程碰磁盘）----------
+
+/// 一次 refresh 的纯数据结果。
+struct RefreshData {
+    env: crate::paths::GameEnv,
+    mods: Vec<ModEntry>,
+    uids: HashSet<String>,
+    norms: HashSet<String>,
+    confs: Vec<(String, String)>,
+}
+
+/// 结果槽：外层 Some 表示「有结果待取」，内层 None 表示线程崩了。
+static REFRESH_RESULT: OnceLock<Mutex<Option<Option<RefreshData>>>> = OnceLock::new();
+/// 同时只允许一个 refresh 在跑。
+static REFRESH_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // ---------- 页面 ----------
 
 #[derive(PartialEq, Clone, Copy)]
@@ -528,6 +544,48 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        if REFRESH_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return; // 上一个还没算完，忽略本次请求
+        }
+        let manual = self.settings.game_path.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // 复用同一套逻辑：在一个临时实例上跑（构造与销毁都在本线程内），
+                // 拿到的只是纯数据，不碰 UI 状态。
+                let mut tmp = App::default();
+                tmp.settings.game_path = manual;
+                tmp.refresh_inner();
+                RefreshData {
+                    env: tmp.env,
+                    mods: tmp.mods,
+                    uids: tmp.installed_uids,
+                    norms: tmp.installed_norms,
+                    confs: tmp.installed_confs,
+                }
+            }))
+            .ok();
+            *REFRESH_RESULT
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap() = Some(r);
+        });
+    }
+
+    /// 套用后台算好的结果（UI 线程，纯内存赋值）。
+    fn apply_refresh(&mut self, d: RefreshData) {
+        self.env = d.env;
+        self.mods = d.mods;
+        if let Some(m) = self.env.mods_path.clone() {
+            crate::watch::set_mods_dir(m.clone());
+            mirror::set_mods_dir(m);
+        }
+        self.mods_ver += 1;
+        self.installed_uids = d.uids;
+        self.installed_norms = d.norms;
+        self.installed_confs = d.confs;
+    }
+
+    fn refresh_inner(&mut self) {
         self.env = paths::detect(self.settings.game_path.as_deref());
         if let Some(g) = &self.env.game_path {
             let mods_dir = g.join("Mods");
@@ -580,6 +638,13 @@ impl App {
     // ---------- 后台结果轮询 ----------
 
     fn poll_background(&mut self, ctx: &egui::Context) {
+        // 后台 refresh 结果：套用新环境与模组清单（结果可能晚一两帧到）。
+        if let Some(r) = REFRESH_RESULT.get().and_then(|m| m.lock().unwrap().take()) {
+            REFRESH_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Some(d) = r {
+                self.apply_refresh(d);
+            }
+        }
         if let Some(r) = LIST_RESULT.get().and_then(|m| m.lock().unwrap().take()) {
             self.list_loading = false;
             match r {
