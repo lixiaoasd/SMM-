@@ -60,7 +60,16 @@ pub fn install_archive(archive: &Path, mods_dir: &Path) -> Result<Vec<String>> {
                 .map(|p| p.to_path_buf())
                 .filter(|g| looks_like_game_dir(g));
             let r = match game {
-                Some(g) => install_smapi_dat(&dat, &g).map(|_| vec!["SMAPI".to_string()]),
+                Some(g) => install_smapi_dat(&dat, &g).map(|_| {
+                    let mut names = vec!["SMAPI".to_string()];
+                    // 顺手把 Steam 启动项指向 SMAPI；只在需要用户处理时占一条提示
+                    // （写入成功不必说，设置页卡片本身就看得见）。
+                    let (attention, note) = smapi_steam_note(&g);
+                    if attention {
+                        names.push(note);
+                    }
+                    names
+                }),
                 None => Err(anyhow::anyhow!(
                     "这是 SMAPI 安装包而不是普通模组，且 Mods 目录不在游戏目录下，\
                      无法定位游戏目录；请改用「设置 → 一键安装/更新 SMAPI」"
@@ -325,11 +334,29 @@ pub fn install_smapi(game_path: &Path) -> Result<String> {
     })();
 
     let _ = std::fs::remove_dir_all(&extract);
-    if result.is_ok() {
-        // 装好就不再留这份 40MB 的临时包；失败时保留，方便排查。
-        let _ = std::fs::remove_file(&zip_path);
+    match result {
+        Ok(msg) => {
+            // 装好就不再留这份 40MB 的临时包；失败时保留，方便排查。
+            let _ = std::fs::remove_file(&zip_path);
+            let (_, note) = smapi_steam_note(game_path);
+            Ok(format!("{msg}；{note}"))
+        }
+        Err(e) => Err(e),
     }
-    result
+}
+
+/// SMAPI 装好后的收尾：把 Steam 启动项指向 SMAPI。
+///
+/// 任何跳过/失败都只影响这一句提示，**绝不影响安装本身的成功结果**。
+/// 返回 (是否需要用户处理, 提示文案)。
+fn smapi_steam_note(game: &Path) -> (bool, String) {
+    match crate::steam::write_launch_option(Some(game), crate::steam::Policy::KeepCustom) {
+        Ok(o) => (o.needs_attention(), o.message()),
+        Err(e) => {
+            crate::mirror::log_line(&format!("设置 Steam 启动项失败：{e}"));
+            (true, format!("Steam 启动项未改：{e}"))
+        }
+    }
 }
 
 /// 解压 zip 到目标目录。

@@ -1,0 +1,1 @@
+497c67339e3a328bc8fba7c49d20a175ae086009e9bc6916fe1635ccebc2b905  FireSVM-ModManager-Setup-b0.7.exe

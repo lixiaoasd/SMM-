@@ -332,20 +332,32 @@ pub fn scan_saves() -> Vec<SaveInfo> {
 // 进程 / 端口 / 网络
 // ============================================================
 
+/// 用 `tasklist` 判断指定映像名的进程是否在跑。
+///
+/// `Some(true)` 在跑、`Some(false)` 没跑、`None` 表示 `tasklist` 起不来（无法确认）。
+/// 统一在这里做，**不要**另外引入 `OpenProcess` 之类的「读别的进程」API ——
+/// 卡巴斯基主动防御会把那类调用判成 PDM 行为检测。
+pub fn process_running(image: &str) -> Option<bool> {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .to_lowercase()
+            .contains(&image.to_lowercase()),
+    )
+}
+
 /// 游戏是否正在运行（SMAPI 或原版）。
 pub fn game_running() -> bool {
-    for image in ["StardewModdingAPI.exe", "Stardew Valley.exe"] {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        if let Ok(o) = out
-            && String::from_utf8_lossy(&o.stdout).to_lowercase().contains(&image.to_lowercase())
-        {
-            return true;
-        }
-    }
-    false
+    ["StardewModdingAPI.exe", "Stardew Valley.exe"]
+        .iter()
+        .any(|image| process_running(image) == Some(true))
 }
 
 /// 用 SMAPI 启动游戏。

@@ -12,6 +12,8 @@ mod mods;
 mod p2p;
 mod paths;
 mod server;
+mod steam;
+mod vdf;
 mod watch;
 mod web;
 
@@ -122,6 +124,14 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 调试入口：--steam-smoke，只读地走一遍「进设置页」会触发的 Steam 探测链路
+    //（注册表取 Steam 安装路径 / 活跃账号 → tasklist 查 steam.exe → 定位活跃账号
+    // → 读它的 localconfig.vdf）。用于回归验证这条链路不会再触发杀软报毒。
+    if args.len() >= 2 && args[1] == "--steam-smoke" {
+        steam_smoke();
+        return Ok(());
+    }
+
     // release 下 windows_subsystem=windows 没有控制台，panic 会静默丢失。
     // 安装 panic hook，把崩溃信息写到 %TEMP%\stardew_mod_manager_crash.log 便于排查。
     install_crash_log();
@@ -160,6 +170,45 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
+}
+
+/// Steam 探测链路冒烟：把「进设置页」触发的系统访问按粒度拆开跑，
+/// 结果写到 %TEMP%\stardew_steam_smoke.log（release 无控制台，println 看不到）。
+///
+/// 用法：`--steam-smoke [reg|runtime|probe]`，逐级叠加：
+/// - `reg`     只有 `reg query` 取 Steam 安装路径；
+/// - `runtime` 叠加 `tasklist` 查 steam.exe、读 ActiveProcess\ActiveUser、
+///             在 `userdata\*` 里定位活跃账号、算出 localconfig.vdf 路径；
+/// - `probe`   再加读取 localconfig.vdf 本体（默认）。
+fn steam_smoke() {
+    use std::io::Write as _;
+
+    let mode = std::env::args().nth(2).unwrap_or_else(|| "probe".to_string());
+    let mut out = format!("mode={mode}\n");
+    out.push_str(&format!("steam_install={:?}\n", paths::steam_install_path()));
+
+    if mode != "reg" {
+        let rt = steam::runtime();
+        out.push_str(&format!("run={:?}\n", rt.run));
+        out.push_str(&format!("account_id={:?}\n", rt.account_id));
+        out.push_str(&format!("localconfig={:?}\n", rt.localconfig));
+    }
+
+    if mode == "probe" {
+        let game = paths::detect_game_path(None);
+        let st = steam::probe(game.as_deref());
+        out.push_str(&format!("game={game:?}\n"));
+        out.push_str(&format!("launch={:?}\n", st.launch));
+        out.push_str(&format!("current={:?}\n", st.current));
+    }
+
+    let path = std::env::temp_dir().join("stardew_steam_smoke.log");
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = f.write_all(out.as_bytes());
+    }
+
+    // 挂住一段时间：杀软的系统监控是异步判定的，进程太短命就来不及反应。
+    std::thread::sleep(Duration::from_secs(20));
 }
 
 /// 监控链路冒烟测试。

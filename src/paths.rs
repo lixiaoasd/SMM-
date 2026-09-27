@@ -13,9 +13,22 @@ pub struct GameEnv {
 }
 
 /// 从注册表读取 Steam 安装路径（HKCU\Software\Valve\Steam 的 SteamPath）。
+///
+/// 结果进程内缓存：Steam 装在哪运行期不会变，而 `reg query` 要起子进程
+/// （实测本机约 200ms/次，杀软拦进程创建时更慢），不能反复问。
 pub fn steam_install_path() -> Option<PathBuf> {
+    static CACHE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(detect_steam_install_path).clone()
+}
+
+fn detect_steam_install_path() -> Option<PathBuf> {
+    // 必须带 CREATE_NO_WINDOW：本程序是 GUI 子系统，不加这个标志时每次起
+    // `reg.exe` 都会新建一个控制台窗口，拖慢整机帧率。
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = Command::new("reg")
         .args(["query", "HKCU\\Software\\Valve\\Steam", "/v", "SteamPath"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);

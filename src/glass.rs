@@ -10,7 +10,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// 窗口标题（main 设窗口、glass 找句柄共用，必须一致）。
@@ -30,11 +30,7 @@ pub fn init(window_title: &'static str) {
             log("window not found within timeout");
             return;
         };
-        log(&format!(
-            "hwnd found: {:p}, os build {}",
-            hwnd,
-            os_build()
-        ));
+        log(&format!("hwnd found: {:p}", hwnd));
         // 尽早移除系统标题栏按钮（Mica 扩展帧后 DWM 会重新画出来）。
         install_borderless_subclass(hwnd);
         // 关键：等交换链/合成器就绪再贴材质。窗口刚创建的前几百毫秒内贴
@@ -140,14 +136,7 @@ unsafe extern "system" {
     fn IsWindowVisible(hwnd: HWND) -> i32;
     fn SetWindowCompositionAttribute(hwnd: HWND, data: *mut WcaData) -> i32;
     fn GetWindowLongPtrW(hwnd: HWND, index: i32) -> isize;
-    fn SetWindowLongPtrW(hwnd: HWND, index: i32, new_proc: isize) -> isize;
-    fn CallWindowProcW(
-        prev_proc: WndProcFn,
-        hwnd: HWND,
-        msg: u32,
-        wparam: usize,
-        lparam: isize,
-    ) -> isize;
+    fn SetWindowLongPtrW(hwnd: HWND, index: i32, new_value: isize) -> isize;
     fn GetWindowRect(hwnd: HWND, rect: *mut RectL) -> i32;
     fn IsZoomed(hwnd: HWND) -> i32;
     fn SetWindowPos(
@@ -161,15 +150,39 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+// comctl32 的标准子类化 API（SetWindowSubclass / DefSubclassProc）。
+// 用独立的 extern 块显式链接，避免依赖工具链的隐式链接。
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn SetWindowSubclass(
+        hwnd: HWND,
+        subclass_proc: SubclassProc,
+        id: usize,
+        ref_data: usize,
+    ) -> i32;
+    fn RemoveWindowSubclass(hwnd: HWND, subclass_proc: SubclassProc, id: usize) -> i32;
+    fn DefSubclassProc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize;
+}
+
 // ---------- 无边框窗口子类化：移除系统标题按钮 ----------
 //
 // with_decorations(false) + DwmExtendFrameIntoClientArea(-1) 之后，Win11 的
 // DWM 仍会在右上角画系统的最小化/最大化/关闭按钮。拦截 WM_NCCALCSIZE 让整个
 // 窗口都成为客户区，系统标题栏（含按钮）即不再绘制；Mica 圆角/阴影不受影响。
 // WM_NCHITTEST 里补回窗口边缘的缩放命中区。
+//
+// 子类化走 comctl32 官方的 SetWindowSubclass，不用 SetWindowLongPtrW(GWLP_WNDPROC)
+// ——后者是"替换窗口过程"的原始手法，与恶意软件的窗口劫持行为特征重合，
+// 会被主动防御的启发式规则误判。
 
-type WndProcFn =
-    unsafe extern "system" fn(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize;
+type SubclassProc = unsafe extern "system" fn(
+    hwnd: HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+    id: usize,
+    ref_data: usize,
+) -> isize;
 
 #[repr(C)]
 struct RectL {
@@ -179,10 +192,10 @@ struct RectL {
     bottom: i32,
 }
 
-const GWLP_WNDPROC: i32 = -4;
 const GWL_STYLE: i32 = -16;
 const WM_NCCALCSIZE: u32 = 0x0083;
 const WM_NCHITTEST: u32 = 0x0084;
+const WM_NCDESTROY: u32 = 0x0082;
 const WM_ERASEBKGND: u32 = 0x0014;
 
 // 窗口样式：去掉标题栏与系统菜单，DWM 就不会再画系统按钮。
@@ -208,54 +221,51 @@ const HTBOTTOMRIGHT: isize = 17;
 /// 边缘缩放命中带宽度（物理像素）。
 const RESIZE_BORDER: i32 = 6;
 
-static OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+/// 子类 ID（同一窗口 + 同一回调重复安装时，comctl32 只更新引用数据，不会叠加）。
+const SUBCLASS_ID: usize = 0x534D_4D01;
 
-/// 安装窗口子类（幂等；多线程并发调用也只会安装一次）。
+/// 安装窗口子类（幂等）。
 fn install_borderless_subclass(hwnd: HWND) {
-    if OLD_WNDPROC.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    // SAFETY：hwnd 由 FindWindowW 取得且窗口存活；替换后所有消息仍转发给旧过程。
+    // SAFETY：hwnd 由 FindWindowW 取得且窗口存活；子类回调转发给 DefSubclassProc。
     unsafe {
-        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, borderless_wndproc as isize);
-        if old == 0 {
+        if SetWindowSubclass(hwnd, borderless_subclass_proc, SUBCLASS_ID, 0) == 0 {
+            log("SetWindowSubclass failed");
             return;
         }
-        // CAS 防后台线程与 UI 线程同时安装：落选者把旧过程还原回去。
-        if OLD_WNDPROC
-            .compare_exchange(0, old, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
-        } else {
-            // 去掉标题栏/系统菜单/最小化最大化框样式，DWM 就不会再绘制
-            // 系统的最小化/最大化/关闭按钮。保留 WS_THICKFRAME 以便拖边缩放。
-            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-            let stripped = style & !(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-            if stripped != style {
-                SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
-                // 通知系统框架已改变，重绘非客户区。
-                SetWindowPos(
-                    hwnd,
-                    core::ptr::null_mut(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                );
-            }
+        // 去掉标题栏/系统菜单/最小化最大化框样式，DWM 就不会再绘制
+        // 系统的最小化/最大化/关闭按钮。保留 WS_THICKFRAME 以便拖边缩放。
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let stripped = style & !(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+        if stripped != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
+            // 通知系统框架已改变，重绘非客户区。
+            SetWindowPos(
+                hwnd,
+                core::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
             log("borderless subclass installed (system caption removed)");
         }
     }
 }
 
-unsafe extern "system" fn borderless_wndproc(
+unsafe extern "system" fn borderless_subclass_proc(
     hwnd: HWND,
     msg: u32,
     wparam: usize,
     lparam: isize,
+    id: usize,
+    _ref_data: usize,
 ) -> isize {
+    if msg == WM_NCDESTROY {
+        // 窗口销毁前注销子类，避免 comctl32 内部残留引用。
+        unsafe { RemoveWindowSubclass(hwnd, borderless_subclass_proc, id) };
+        return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+    }
     if msg == WM_NCCALCSIZE && wparam == 1 {
         // 保持建议矩形不动并返回 0：客户区占满整个窗口，
         // 系统标题栏与最小化/最大化/关闭按钮全部移除。
@@ -267,14 +277,8 @@ unsafe extern "system" fn borderless_wndproc(
         return 1;
     }
 
-    let old = OLD_WNDPROC.load(Ordering::Acquire);
-    if old == 0 {
-        return 0;
-    }
-    let old_proc: WndProcFn = unsafe { core::mem::transmute(old) };
-
     if msg == WM_NCHITTEST {
-        let hit = unsafe { CallWindowProcW(old_proc, hwnd, msg, wparam, lparam) };
+        let hit = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
         // winit 把无边框窗口的客户区命中统一交给应用；在窗口最外圈
         // 补一条缩放带，保留拖边调整大小（最大化时不处理，交给系统）。
         if hit == HTCLIENT && unsafe { IsZoomed(hwnd) } == 0 {
@@ -308,7 +312,7 @@ unsafe extern "system" fn borderless_wndproc(
         return hit;
     }
 
-    unsafe { CallWindowProcW(old_proc, hwnd, msg, wparam, lparam) }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
@@ -494,38 +498,4 @@ unsafe fn apply_accent(hwnd: HWND, state: u32, color: u32) -> bool {
         size: size_of::<AccentPolicy>(),
     };
     SetWindowCompositionAttribute(hwnd, &mut data) != 0
-}
-
-/// 读取系统内部版本号（用于诊断；失败返回 0）。
-fn os_build() -> u32 {
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
-    }
-    #[repr(C)]
-    #[allow(non_snake_case)]
-    struct OsVersionInfo {
-        size: u32,
-        Major: u32,
-        Minor: u32,
-        Build: u32,
-        Platform: u32,
-        szCSDVersion: [u16; 128],
-    }
-    let mut info = OsVersionInfo {
-        size: size_of::<OsVersionInfo>() as u32,
-        Major: 0,
-        Minor: 0,
-        Build: 0,
-        Platform: 0,
-        szCSDVersion: [0; 128],
-    };
-    // SAFETY：结构体大小正确，RtlGetVersion 不做访问校验。
-    unsafe {
-        if RtlGetVersion(&mut info) == 0 {
-            info.Build
-        } else {
-            0
-        }
-    }
 }

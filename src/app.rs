@@ -40,6 +40,10 @@ static SMAPI_RESULT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SAVES_RESULT: OnceLock<Mutex<Option<Vec<SaveInfo>>>> = OnceLock::new();
 static HOST_PROBE_RESULT: OnceLock<Mutex<Option<HostProbe>>> = OnceLock::new();
 static HOST_MSG_RESULT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Steam 启动项状态（设置页 3 秒 TTL 复探用）。
+static STEAM_RESULT: OnceLock<Mutex<Option<crate::steam::SteamStatus>>> = OnceLock::new();
+/// Steam 启动项写入结果（文案）。
+static STEAM_SET_RESULT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 // —— 联机大厅 ——
 static PEERS_RESULT: OnceLock<Mutex<Option<Vec<PeerInfo>>>> = OnceLock::new();
@@ -355,6 +359,14 @@ pub struct App {
     api_key_input: String,
     mirror_url_input: String,
     smapi_busy: bool,
+    /// Steam 启动项状态（由后台探测维护，UI 只读）。
+    steam: crate::steam::SteamStatus,
+    steam_busy: bool,
+    steam_set_busy: bool,
+    /// 需要重新探测 Steam 状态（进入设置页时、点「重新检测」时、写入后）。
+    steam_need_probe: bool,
+    /// 上一帧所在页面，用来识别「刚切到设置页」。
+    prev_page: Page,
 
     // —— 一键开服页 ——
     saves: Vec<SaveInfo>,
@@ -478,6 +490,12 @@ impl Default for App {
             api_key_input: String::new(),
             mirror_url_input: String::new(),
             smapi_busy: false,
+            steam: crate::steam::SteamStatus::default(),
+            steam_busy: false,
+            steam_set_busy: false,
+            // 首次进设置页才探（避免启动时就白起几个子进程）。
+            steam_need_probe: false,
+            prev_page: Page::Download,
             saves: Vec::new(),
             saves_loaded: false,
             probe: HostProbe::default(),
@@ -633,6 +651,9 @@ impl App {
                     .map(move |c| (c.clone(), name.clone()))
             })
             .collect();
+        // Steam 状态不在这里探：它只在设置页展示，改由进入设置页时触发一次
+        // （见 steam_need_probe）。原先在这里也探一次，等于每次 refresh 白起
+        // 2~3 个子进程，而子进程创建在这台机器上要 ~200ms，纯浪费。
     }
 
     // ---------- 后台结果轮询 ----------
@@ -681,6 +702,17 @@ impl App {
             self.smapi_busy = false;
             self.status = msg;
             self.refresh();
+        }
+        // Steam 启动项：探测结果与写入结果。
+        if let Some(s) = STEAM_RESULT.get().and_then(|m| m.lock().unwrap().take()) {
+            self.steam_busy = false;
+            self.steam = s;
+        }
+        if let Some(msg) = STEAM_SET_RESULT.get().and_then(|m| m.lock().unwrap().take()) {
+            self.steam_set_busy = false;
+            self.status = msg;
+            // 写入后重探一次，让卡片状态跟上。
+            self.steam_need_probe = true;
         }
         if let Some(r) = MIRROR_LIST_RESULT.get().and_then(|m| m.lock().unwrap().take()) {
             self.mirror_loading = false;
@@ -1399,6 +1431,40 @@ impl App {
             },
         );
     }
+
+    /// 后台复探 Steam 启动项状态（设置页 TTL 触发，或「重新检测」按钮）。
+    fn probe_steam_bg(&mut self) {
+        if self.steam_busy {
+            return;
+        }
+        self.steam_busy = true;
+        let game = self.env.game_path.clone();
+        spawn_bg(
+            STEAM_RESULT.get_or_init(|| Mutex::new(None)),
+            crate::steam::SteamStatus::default(),
+            move || crate::steam::probe(game.as_deref()),
+        );
+    }
+
+    /// 后台写入/清空 Steam 启动项。`game` 为 `None` 表示清空。
+    fn set_steam_launch_bg(&mut self, game: Option<PathBuf>) {
+        if self.steam_set_busy {
+            return;
+        }
+        self.steam_set_busy = true;
+        self.status = "正在写入 Steam 启动项…".to_string();
+        spawn_bg(
+            STEAM_SET_RESULT.get_or_init(|| Mutex::new(None)),
+            "后台任务异常终止，请重试".to_string(),
+            move || {
+                let policy = crate::steam::Policy::Overwrite;
+                match crate::steam::write_launch_option(game.as_deref(), policy) {
+                    Ok(o) => o.message(),
+                    Err(e) => format!("写入 Steam 启动项失败：{e}"),
+                }
+            },
+        );
+    }
 }
 
 impl eframe::App for App {
@@ -1424,6 +1490,12 @@ impl eframe::App for App {
             self.start.elapsed().as_secs_f64(),
         );
         self.poll_background(&ctx);
+
+        // 刚切到设置页 → 标一次待探测（探测要起子进程，不能每帧做）。
+        if self.page == Page::Settings && self.prev_page != Page::Settings {
+            self.steam_need_probe = true;
+        }
+        self.prev_page = self.page;
 
         self.ui_title_bar(ui);
         self.ui_sidebar(ui);
@@ -5092,6 +5164,22 @@ impl App {
 
 impl App {
     fn ui_settings_page(&mut self, ui: &mut egui::Ui) {
+        // 只在「刚进设置页 / 点了重新检测 / 写入后」探一次。原来做的是 3 秒
+        // 轮询，而一次探测要起 1~2 个 `reg` + 1 个 `tasklist`，本机每次子进程
+        // 创建约 200ms（杀软拦进程创建时更久），轮询会把界面拖成幻灯片。
+        if self.steam_need_probe && !self.steam_busy {
+            self.steam_need_probe = false;
+            self.probe_steam_bg();
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.ui_settings_page_inner(ui);
+            });
+    }
+
+    fn ui_settings_page_inner(&mut self, ui: &mut egui::Ui) {
         // 游戏环境
         liquid::card_accent(ui, Some(liquid::PRIMARY), |ui| {
             ui.set_width(ui.available_width());
@@ -5258,7 +5346,162 @@ impl App {
                     .weak(),
             );
         });
+        ui.add_space(8.0);
+
+        self.ui_steam_launch_card(ui);
     }
+
+    /// 「Steam 启动项」卡片：查看 / 设置 / 清空，并提示所有会导致写不进去的前置条件。
+    fn ui_steam_launch_card(&mut self, ui: &mut egui::Ui) {
+        use crate::steam::LaunchState;
+
+        let running = self.steam.runtime.running();
+        let unknown = self.steam.runtime.state_unknown();
+        let game = self.env.game_path.clone();
+        let smapi_ok = game
+            .as_ref()
+            .map(|g| g.join("StardewModdingAPI.exe").is_file())
+            .unwrap_or(false);
+        // 只有「可写」的状态才允许按按钮。
+        let writable = matches!(
+            self.steam.launch,
+            LaunchState::Unset
+                | LaunchState::PointsToSmapi
+                | LaunchState::StalePath { .. }
+                | LaunchState::PointsElsewhere { .. }
+        );
+        let can_write = smapi_ok && writable && !running && !unknown && !self.steam_set_busy;
+
+        liquid::card_accent(ui, Some(liquid::PRIMARY), |ui| {
+            ui.set_width(ui.available_width());
+            liquid::section_title(ui, "Steam 启动项（用 SMAPI 启动游戏）", liquid::PRIMARY);
+
+            match &self.steam.launch {
+                LaunchState::NoSteam => {
+                    ui.label(
+                        RichText::new("未检测到 Steam 安装，本功能不适用（GOG / 手动安装版无需设置）")
+                            .color(liquid::text_dim()),
+                    );
+                }
+                LaunchState::NotSteamGame => {
+                    ui.label(
+                        RichText::new("当前游戏目录不是 Steam 版，无需设置启动项")
+                            .color(liquid::text_dim()),
+                    );
+                }
+                LaunchState::NoSmapi => {
+                    ui.label(
+                        RichText::new("游戏目录下没有 StardewModdingAPI.exe，请先安装 SMAPI")
+                            .color(liquid::WARNING),
+                    );
+                }
+                LaunchState::NoAccount => {
+                    ui.label(
+                        RichText::new(
+                            "定位不到 Steam 活跃账号的配置。若你有多个账号，请用要修改的那个登录一次 Steam 后点「重新检测」。",
+                        )
+                        .color(liquid::WARNING),
+                    );
+                }
+                LaunchState::Unreadable(e) => {
+                    ui.label(
+                        RichText::new(format!("Steam 配置无法解析，已拒绝写入：{e}"))
+                            .color(liquid::DANGER),
+                    );
+                }
+                LaunchState::Unset => {
+                    ui.label(
+                        RichText::new("未设置（Steam 会直接启动原版，模组不生效）")
+                            .color(liquid::WARNING),
+                    );
+                }
+                LaunchState::PointsToSmapi => {
+                    let cur = self.steam.current.clone().unwrap_or_default();
+                    ui.label(
+                        RichText::new(format!("已指向 SMAPI：{}", ellipsize(&cur, 70)))
+                            .color(liquid::SUCCESS),
+                    );
+                }
+                LaunchState::StalePath { value } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "启动项指向的 SMAPI 已不存在（游戏目录可能搬过）：{}",
+                            ellipsize(value, 70)
+                        ))
+                        .color(liquid::WARNING),
+                    );
+                }
+                LaunchState::PointsElsewhere { value } => {
+                    ui.label(
+                        RichText::new(format!("启动项已有其它内容：{}", ellipsize(value, 70)))
+                            .color(liquid::WARNING),
+                    );
+                    ui.label(
+                        RichText::new("点「指向 SMAPI」会覆盖它（你的自定义参数会丢失）。")
+                            .size(11.0)
+                            .weak(),
+                    );
+                }
+            }
+
+            ui.horizontal(|ui| {
+                if liquid::cta_button(ui, "指向 SMAPI", can_write).clicked() {
+                    self.set_steam_launch_bg(game.clone());
+                }
+                if liquid::cta_button(ui, "恢复为无", can_write).clicked() {
+                    self.set_steam_launch_bg(None);
+                }
+                if ui.small_button("重新检测").clicked() {
+                    self.steam_need_probe = true;
+                }
+                if ui.small_button("恢复上次备份").clicked() {
+                    match crate::steam::restore_latest_backup() {
+                        Ok(p) => {
+                            self.status = format!("已恢复备份：{}", p.display());
+                            self.steam_need_probe = true;
+                        }
+                        Err(e) => self.status = format!("恢复备份失败：{e}"),
+                    }
+                }
+                if self.steam_busy || self.steam_set_busy {
+                    liquid::spinner(ui);
+                }
+            });
+
+            if running {
+                ui.label(
+                    RichText::new(
+                        "Steam 正在运行：它会在退出时把内存里的配置写回磁盘，会覆盖本次修改。\
+                         请右键托盘图标 → 退出 Steam 后再设置。",
+                    )
+                    .size(11.0)
+                    .color(liquid::WARNING),
+                );
+            } else if unknown {
+                ui.label(
+                    RichText::new("无法确认 Steam 是否已退出，为避免改动被覆盖，暂时不允许写入。")
+                        .size(11.0)
+                        .color(liquid::WARNING),
+                );
+            } else {
+                ui.label(
+                    RichText::new("设置后请重启 Steam，在「属性 → 启动选项」里可核对。")
+                        .size(11.0)
+                        .weak(),
+                );
+            }
+        });
+    }
+}
+
+/// 长路径截断显示（保留尾部，尾部才是关键的文件名）。
+fn ellipsize(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - max + 1).collect();
+    format!("…{tail}")
 }
 
 // ---------- 小工具 ----------
